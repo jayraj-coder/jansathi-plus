@@ -1,0 +1,36 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Uploaded files and local data
+data/uploads/
+data/tessdata/
+
+# Node / Expo
+node_modules/
+.expo/
+dist/
+web-build/
+coverage/
+
+# Build and operating system files
+build/
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+data/uvicorn-mobile-audit.err
