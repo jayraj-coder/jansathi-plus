@@ -36,7 +36,7 @@ def test_upload_extracts_lists_and_opens_text_file(app_client):
     record = upload.json()
     assert record["status"] == "completed"
     assert "20 August" in record["overview"]
-    assert record["language"] == "und"
+    assert record["language"] == "en"
     assert "owner_id" not in record
     assert len(app_client.get("/api/documents", headers=headers).json()) == 1
     assert app_client.get(f"/api/documents/{record['id']}/file", headers=headers).content == b"Submit the form by 20 August."
@@ -126,6 +126,21 @@ def test_upload_enforces_configured_size_limit(app_client, monkeypatch):
         files={"file": ("large.txt", b"more than eight bytes", "text/plain")},
     )
     assert response.status_code == 413
+
+
+def test_database_insert_failure_returns_503_and_removes_uploaded_file(app_client, monkeypatch):
+    class FailingCollection:
+        def insert_one(self, record):
+            raise api.PyMongoError("insert failed")
+
+    monkeypatch.setattr(api, "documents", FailingCollection())
+    response = app_client.post(
+        "/api/documents",
+        headers=guest_headers(),
+        files={"file": ("notice.txt", b"A public notice with an application date.", "text/plain")},
+    )
+    assert response.status_code == 503
+    assert list(api.STORAGE.iterdir()) == []
 
 
 def test_empty_text_file_is_not_reported_as_ocr_needed(app_client):

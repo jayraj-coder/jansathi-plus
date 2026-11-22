@@ -8,8 +8,10 @@ import subprocess
 import uuid
 import logging
 import contextvars
+from contextlib import contextmanager
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,11 +51,14 @@ SYSTEM_TESSDATA_DIRS = (
     Path("/usr/share/tessdata"),
 )
 _OCR_UPLOAD_ID = contextvars.ContextVar("ocr_upload_id", default="unknown")
+_OCR_DEADLINE = contextvars.ContextVar("ocr_deadline", default=None)
 _TESSERACT_LOCK = threading.Lock()
 _TESSERACT_CACHE = None
 _OCR_LANGUAGE_CACHE: dict[str, list[str]] = {}
 OCR_SUBPROCESS_TIMEOUT = float(os.getenv("OCR_SUBPROCESS_TIMEOUT", "25"))
+OCR_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "90"))
 OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "2")))
+OCR_QUEUE_TIMEOUT = float(os.getenv("OCR_QUEUE_TIMEOUT", "10"))
 _OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
@@ -63,6 +68,20 @@ def _ocr_log(stage: str, duration: float | None = None, level: int = logging.INF
     elapsed = f" duration_ms={duration * 1000:.1f}" if duration is not None else ""
     logger.log(level, "OCR upload_id=%s stage=%s%s%s", _OCR_UPLOAD_ID.get(), stage, elapsed,
                f" {details}" if details else "")
+
+
+@contextmanager
+def _ocr_process_slot():
+    queued = time.perf_counter()
+    acquired = _OCR_SEMAPHORE.acquire(timeout=OCR_QUEUE_TIMEOUT)
+    _ocr_log("subprocess_queue", time.perf_counter() - queued,
+             result="acquired" if acquired else "timeout")
+    if not acquired:
+        raise OCRProcessingTimeout("OCR concurrency queue timed out")
+    try:
+        yield
+    finally:
+        _OCR_SEMAPHORE.release()
 
 app = FastAPI(title="JanSathi API", version="1.0.0", description="Private document understanding and citizen information API")
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(","), allow_credentials=False, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["*"])
@@ -477,21 +496,35 @@ def _psm_config(base_config: str, psm: int) -> str:
     return base_config + f" --psm {psm}"
 
 
+class OCRProcessingTimeout(TimeoutError):
+    """Raised when an OCR child process reaches its enforced deadline."""
+
+
 def _run_ocr(pytesseract, image: Image.Image, config: str):
     """Run one bounded Tesseract subprocess and derive both text and confidence."""
     started = time.perf_counter()
+    deadline = _OCR_DEADLINE.get()
+    timeout = OCR_SUBPROCESS_TIMEOUT
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.perf_counter())
+    if timeout <= 0:
+        raise OCRProcessingTimeout("OCR document deadline exceeded")
     try:
         data = pytesseract.image_to_data(
             image, config=config, output_type=pytesseract.Output.DICT,
-            timeout=OCR_SUBPROCESS_TIMEOUT,
+            timeout=timeout,
         )
+    except OCRProcessingTimeout:
+        raise
     except Exception as exc:
         _ocr_log("tesseract_subprocess", time.perf_counter() - started,
                  level=logging.ERROR, config=shlex.quote(config),
-                 timeout_s=OCR_SUBPROCESS_TIMEOUT, result=type(exc).__name__)
+                 timeout_s=timeout, result=type(exc).__name__)
+        if isinstance(exc, RuntimeError) and "process timeout" in str(exc).lower():
+            raise OCRProcessingTimeout("Tesseract subprocess timed out") from exc
         raise
     _ocr_log("tesseract_subprocess", time.perf_counter() - started, config=shlex.quote(config),
-             timeout_s=OCR_SUBPROCESS_TIMEOUT, result="ok")
+             timeout_s=timeout, result="ok")
     confidence = _mean_confidence(data)
     # image_to_data is a single Tesseract pass. Reconstruct normalized lines from
     # the returned words so text and confidence describe the same recognition run.
@@ -579,7 +612,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
         variants = _pil_variants(image, include_fallbacks=False)
         _ocr_log("image_preprocessing", time.perf_counter() - preprocessing_started,
                  variant=variants[0][0], size=f"{variants[0][1].width}x{variants[0][1].height}")
-        with _OCR_SEMAPHORE:
+        with _ocr_process_slot():
             best_text = ""
             best_confidence = -1.0
             _name, variant = variants[0]
@@ -624,6 +657,8 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
             _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
                      confidence=f"{best_confidence:.1f}", chars=len(normalized))
             return normalized, "ocr"
+    except OCRProcessingTimeout:
+        raise
     except Exception as exc:
         _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
                  level=logging.ERROR, result=type(exc).__name__)
@@ -632,6 +667,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
 
 
 def extract_scanned_pdf(path: Path) -> tuple[str, str]:
+    total_started = time.perf_counter()
     pytesseract = configure_tesseract()
     if not pytesseract:
         logger.warning("OCR unavailable: tesseract not configured")
@@ -645,36 +681,62 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
         pages = []
         with pdfium.PdfDocument(str(path)) as pdf:
             for index in range(min(len(pdf), 20)):
+                if _OCR_DEADLINE.get() is not None and time.perf_counter() >= _OCR_DEADLINE.get():
+                    raise OCRProcessingTimeout("OCR document deadline exceeded")
+                page_started = time.perf_counter()
+                loading_started = time.perf_counter()
                 page = pdf[index]
                 bitmap = page.render(scale=2)
+                _ocr_log("image_loading", time.perf_counter() - loading_started,
+                         pdf_page=index + 1, size=f"{bitmap.width}x{bitmap.height}")
                 try:
                     with bitmap.to_pil() as image:
                         image = image.convert("RGB")
                         image = _bound_dimensions(image)
+                        preprocessing_started = time.perf_counter()
+                        variants = _pil_variants(image, include_fallbacks=False)
+                        _ocr_log("image_preprocessing", time.perf_counter() - preprocessing_started,
+                                 pdf_page=index + 1, variant=variants[0][0],
+                                 size=f"{variants[0][1].width}x{variants[0][1].height}")
+                        variant = variants[0][1]
                         best_text = ""
                         best_confidence = -1.0
-                        for _name, variant in _pil_variants(image):
-                            try:
-                                text, confidence = _run_ocr(
-                                    pytesseract, variant, _psm_config(base_config, 6)
-                                )
-                                if confidence > best_confidence or (
-                                    confidence == best_confidence and len(text) > len(best_text)
-                                ):
-                                    best_text = text
-                                    best_confidence = confidence
-                            except Exception:
-                                continue
+                        with _ocr_process_slot():
+                            text, confidence = _run_ocr(
+                                pytesseract, variant, _psm_config(base_config, 6)
+                            )
+                            best_text, best_confidence = text, confidence
+                            if confidence < CONFIDENCE_FLOOR:
+                                try:
+                                    fallback_text, fallback_confidence = _run_ocr(
+                                        pytesseract, variant, _psm_config(base_config, 11)
+                                    )
+                                    if fallback_confidence > best_confidence or (
+                                        fallback_confidence == best_confidence and len(fallback_text) > len(best_text)
+                                    ):
+                                        best_text, best_confidence = fallback_text, fallback_confidence
+                                except OCRProcessingTimeout:
+                                    raise
+                                except Exception as exc:
+                                    _ocr_log("psm_execution", level=logging.WARNING,
+                                             pdf_page=index + 1, mode=11, result=type(exc).__name__)
                         pages.append(_normalize_ocr_text(best_text))
-                        logger.info(
-                            "OCR pdf page=%d chars=%d confidence=%.1f",
-                            index, len(best_text), best_confidence,
-                        )
+                        _ocr_log("pdf_page_ocr", time.perf_counter() - page_started,
+                                 pdf_page=index + 1, chars=len(best_text),
+                                 confidence=f"{best_confidence:.1f}")
                 finally:
                     bitmap.close()
                     page.close()
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 pdf_pages=len(pages), result="ok")
         return "\n".join(pages), "pdf_ocr"
+    except OCRProcessingTimeout:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 level=logging.ERROR, result="timeout")
+        raise
     except Exception as exc:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 level=logging.ERROR, result=type(exc).__name__)
         logger.warning("Scanned PDF OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
 
@@ -683,14 +745,16 @@ def get_ocr_languages() -> list[str]:
     pytesseract = configure_tesseract()
     if not pytesseract:
         return []
-    try:
-        available = set(pytesseract.get_languages(config=_tessdata_config()))
-        languages = [lang for lang in OCR_LANGS if lang in available]
-        logger.info("Available OCR languages: %s.", ", ".join(languages) if languages else "none")
-        return languages
-    except Exception as exc:
-        logger.warning("Tesseract language detection failed (%s).", type(exc).__name__)
+    config = ocr_language_config(pytesseract)
+    if not config:
         return []
+    parts = shlex.split(config)
+    try:
+        languages = parts[parts.index("-l") + 1].split("+")
+    except (ValueError, IndexError):
+        return []
+    logger.info("Available OCR languages: %s.", ", ".join(languages) if languages else "none")
+    return languages
 
 
 def validate_signature(path: Path, suffix: str) -> bool:
@@ -705,6 +769,47 @@ def simple_summary(text: str) -> str:
         return "Text extraction returned no readable content. This may be a scanned document; OCR is not configured on this server."
     snippets = re.split(r"(?<=[.!?।])\s+", clean)
     return " ".join(snippets[:3])[:950]
+
+
+_ENGLISH_MARKERS = {
+    "a", "about", "after", "all", "and", "are", "as", "at", "by", "can", "community",
+    "date", "for", "from", "government", "health", "in", "is", "may", "must", "notice",
+    "of", "on", "or", "public", "shall", "submit", "the", "this", "to", "with", "your",
+}
+
+
+def detect_document_language(text: str) -> str:
+    """Infer supported languages from script and conservative English markers.
+
+    Indic scripts identify Hindi and Gujarati directly. Latin script alone does
+    not prove English, so English also needs recognizable common vocabulary.
+    Mixed documents return a stable `en+hi`, `en+gu`, `hi+gu`, or `en+hi+gu` tag.
+    """
+    letters = [character for character in text if unicodedata.category(character).startswith("L")]
+    if not letters:
+        return "und"
+    counts = {
+        "en": sum(character.isascii() and character.isalpha() for character in letters),
+        "hi": sum("\u0900" <= character <= "\u097f" for character in letters),
+        "gu": sum("\u0a80" <= character <= "\u0aff" for character in letters),
+    }
+    total = len(letters)
+    words = re.findall(r"[A-Za-z]+", text.lower())
+    english_markers = sum(word in _ENGLISH_MARKERS for word in words)
+    present = []
+    if counts["en"] >= 3 and counts["en"] / total >= 0.22 and english_markers >= 2:
+        present.append("en")
+    if counts["hi"] >= 3 and counts["hi"] / total >= 0.22:
+        present.append("hi")
+    if counts["gu"] >= 3 and counts["gu"] / total >= 0.22:
+        present.append("gu")
+    if len(present) > 1:
+        dominant_count = max(counts[language] for language in present)
+        # OCR can substitute a few glyphs into a neighboring Indic script.
+        # Call a document mixed only when both scripts have comparable evidence.
+        present = [language for language in present
+                   if counts[language] >= dominant_count * 0.5]
+    return "+".join(present) if present else "und"
 
 @app.get("/api/health")
 def health():
@@ -766,20 +871,26 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
             raise HTTPException(415, "The file content does not match its extension.")
         logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
         upload_context = _OCR_UPLOAD_ID.set(doc_id)
+        deadline_context = _OCR_DEADLINE.set(time.perf_counter() + OCR_DOCUMENT_TIMEOUT)
         try:
             text, extraction = await asyncio.wait_for(
                 run_in_threadpool(extract_text, target, suffix), timeout=UPLOAD_OCR_TIMEOUT
             )
+        except OCRProcessingTimeout as exc:
+            target.unlink(missing_ok=True)
+            logger.error("Upload %s: OCR subprocess deadline reached (%s)", doc_id, type(exc).__name__)
+            raise HTTPException(504, "Document OCR timed out. Please try a smaller or simpler file.")
         except asyncio.TimeoutError:
             target.unlink(missing_ok=True)
             logger.error("Upload %s: OCR/text extraction timed out after %ss", doc_id, UPLOAD_OCR_TIMEOUT)
             raise HTTPException(504, "Document processing timed out. Please try a smaller or simpler file.")
         finally:
             _OCR_UPLOAD_ID.reset(upload_context)
+            _OCR_DEADLINE.reset(deadline_context)
         text = text[:500_000]
         logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
-        record = {"id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name, "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size, "created_at": datetime.now(timezone.utc).isoformat(), "status": status, "language": "und", "extraction": extraction, "text": text, "overview": simple_summary(text), "path": str(target)}
+        record = {"id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name, "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size, "created_at": datetime.now(timezone.utc).isoformat(), "status": status, "language": detect_document_language(text), "extraction": extraction, "text": text, "overview": simple_summary(text), "path": str(target)}
         save_doc(record)
         logger.info("Upload %s: saved (status=%s)", doc_id, status)
         return public_document(record)

@@ -350,6 +350,22 @@ def test_normalize_collapses_whitespace_and_preserves_punctuation():
     assert api._normalize_ocr_text("   ") == ""
 
 
+def test_document_language_inference_for_supported_and_mixed_scripts():
+    assert api.detect_document_language("Submit the public form by the due date.") == "en"
+    assert api.detect_document_language("सरकारी सूचना नागरिकों के लिए है।") == "hi"
+    assert api.detect_document_language("જાહેર સૂચના નાગરિકો માટે છે.") == "gu"
+    assert api.detect_document_language("The public notice सरकारी नागरिकों के लिए है.") == "en+hi"
+    noisy_hindi = (
+        "\u0ab8\u0abe\u0ab0\u0acd\u0a96\u0aa8\u0a9c\u0abf \u0938\u0942\u091a\u0928\u093e "
+        "\u0938\u0935\u0938\u0925\u094d\u092f \u0936\u0935\u093f\u0930\u093f "
+        "\u0906\u0935\u0947\u0926\u0928 \u0915\u0940 \u0905\u0902\u0924\u092e\u093f "
+        "\u0aa4\u0aa5\u0abe 30 \u091c\u0942\u0928 2027"
+    )
+    assert api.detect_document_language(noisy_hindi) == "hi"
+    assert api.detect_document_language("123 !!!") == "und"
+    assert api.detect_document_language("bonjour tout le monde") == "und"
+
+
 # ---------------- OCR selection / fallback ----------------
 
 def _install_mock_pytesseract(monkeypatch, psm_text_conf):
@@ -384,6 +400,83 @@ def test_single_tsv_pass_provides_text_and_numeric_confidence(monkeypatch):
     text, confidence = api._run_ocr(mock, _make_image(), "-l eng --psm 6")
     assert text == "JANSAATHI PLUS"
     assert confidence == 83
+
+
+def test_ocr_subprocess_timeout_is_capped_by_document_deadline():
+    mock = _mock_pytesseract({6: ("PUBLIC NOTICE", 90)})
+    seen = {}
+    original = mock.image_to_data
+
+    def record_timeout(image, config="", output_type=None, timeout=None):
+        seen["timeout"] = timeout
+        return original(image, config=config, output_type=output_type, timeout=timeout)
+
+    mock.image_to_data = record_timeout
+    token = api._OCR_DEADLINE.set(time.perf_counter() + 0.4)
+    try:
+        api._run_ocr(mock, _make_image(), "-l eng --psm 6")
+    finally:
+        api._OCR_DEADLINE.reset(token)
+    assert 0 < seen["timeout"] <= 0.4
+
+
+def test_scanned_pdf_starts_with_one_preprocessed_psm6_pass(tmp_path, monkeypatch):
+    import sys
+
+    class Bitmap:
+        width, height = 240, 120
+
+        def to_pil(self):
+            class ImageContext:
+                def __enter__(self):
+                    return Image.new("RGB", (240, 120), "white")
+
+                def __exit__(self, *_):
+                    return False
+
+            return ImageContext()
+
+        def close(self):
+            pass
+
+    class Page:
+        def render(self, scale=1):
+            assert scale == 2
+            return Bitmap()
+
+        def close(self):
+            pass
+
+    class Pdf:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return Page()
+
+    monkeypatch.setitem(sys.modules, "pypdfium2", SimpleNamespace(PdfDocument=Pdf))
+    monkeypatch.setattr(api, "configure_tesseract", lambda: SimpleNamespace())
+    monkeypatch.setattr(api, "ocr_language_config", lambda _: "-l eng")
+    calls = []
+
+    def run_ocr(_pytesseract, _image, config):
+        calls.append(config)
+        return "PUBLIC NOTICE", 90
+
+    monkeypatch.setattr(api, "_run_ocr", run_ocr)
+    result = api.extract_scanned_pdf(tmp_path / "scan.pdf")
+    assert result == ("PUBLIC NOTICE", "pdf_ocr")
+    assert calls == ["-l eng --psm 6"]
 
 
 def test_real_tesseract_subprocess_timeout_terminates_process_and_cleans_temp_files(tmp_path, monkeypatch):
@@ -437,6 +530,20 @@ int main(void) {
     assert {p.name for p in temp_dir.glob("tess_*")} == temp_before
 
 
+def test_real_child_process_is_killed_by_pytesseract_timeout_manager():
+    import sys
+    import pytesseract
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    with pytest.raises(RuntimeError, match="timeout"):
+        with pytesseract.pytesseract.timeout_manager(process, 0.4):
+            pass
+    assert process.poll() is not None
+
+
 def test_ocr_language_config_reports_english_hindi_gujarati(monkeypatch):
     m = _mock_pytesseract({6: ("text", 95)})
     monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
@@ -449,6 +556,15 @@ def test_extract_image_ocr_missing_tesseract_returns_unavailable(tmp_path, monke
     img.save(tmp_path / "doc.png")
     monkeypatch.setattr(api, "configure_tesseract", lambda: None)
     text, label = api.extract_image_ocr(tmp_path / "doc.png")
+    assert text == ""
+    assert label == "ocr_unavailable"
+
+
+def test_extract_image_ocr_corrupt_image_returns_unavailable(tmp_path, monkeypatch):
+    corrupt = tmp_path / "corrupt.png"
+    corrupt.write_bytes(b"not an image")
+    _install_mock_pytesseract(monkeypatch, {6: ("", 0)})
+    text, label = api.extract_image_ocr(corrupt)
     assert text == ""
     assert label == "ocr_unavailable"
 
@@ -536,6 +652,21 @@ def test_upload_pdf_returns_valid_json(tmp_path, monkeypatch):
     assert data["status"] == "completed"
 
 
+def test_upload_docx_extracts_paragraph_text(tmp_path):
+    from docx import Document
+
+    path = tmp_path / "notice.docx"
+    document = Document()
+    document.add_paragraph("Submit the public form by 30 June.")
+    document.save(path)
+    client = TestClient(api.app)
+    with path.open("rb") as stream:
+        response = client.post("/api/documents", files={"file": (path.name, stream, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}, headers=GUEST)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert response.json()["language"] == "en"
+
+
 def test_upload_txt_returns_valid_json(tmp_path, monkeypatch):
     _fake_extract_text(monkeypatch, "TXT extracted text", "text")
     client = TestClient(api.app)
@@ -572,6 +703,19 @@ def test_upload_ocr_timeout_returns_504(tmp_path, monkeypatch):
         r = client.post("/api/documents", files={"file": ("doc.jpg", f, "image/jpeg")}, headers=GUEST)
     assert r.status_code == 504, r.text
     assert "timed out" in r.json()["detail"].lower()
+
+
+def test_upload_ocr_subprocess_deadline_returns_504(tmp_path, monkeypatch):
+    def timeout(path, suffix):
+        raise api.OCRProcessingTimeout("Tesseract process timeout")
+
+    monkeypatch.setattr(api, "extract_text", timeout)
+    client = TestClient(api.app)
+    img = _make_upload_file(tmp_path, "doc.jpg", b"\xff\xd8\xff\xe0fake jpg")
+    with open(img, "rb") as f:
+        response = client.post("/api/documents", files={"file": ("doc.jpg", f, "image/jpeg")}, headers=GUEST)
+    assert response.status_code == 504
+    assert "OCR timed out" in response.json()["detail"]
 
 
 def test_upload_ocr_subprocess_failure_returns_422(tmp_path, monkeypatch):

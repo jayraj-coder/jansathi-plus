@@ -17,6 +17,12 @@ Open http://127.0.0.1:8000. API documentation is available at http://127.0.0.1:8
 
 Run the backend contract tests with `pip install -r requirements-dev.txt` and `python -m pytest`.
 
+## Live MVP
+
+Production: [jansathi-plus.onrender.com](https://jansathi-plus.onrender.com). The health endpoint reports MongoDB, AI, and OCR configuration. On 22 November 2026 it reported MongoDB connected, Groq configured, and `eng`, `hin`, and `guj` OCR data available. A generated, non-sensitive public-notice image uploaded and retrieved successfully. Production files are stored on local service disk, which may be ephemeral across Render restarts or redeploys; Atlas stores extracted document records.
+
+Hackathon presentation content and a truthful demo outline are collected in [IDEAFORGE_SUBMISSION.md](IDEAFORGE_SUBMISSION.md). This is preparation material; it is not a submitted entry.
+
 ## Configuration
 
 The backend reads `.env` from the project root. Keep that file private; it is ignored by Git. `MONGODB_URI` and `MONGODB_DATABASE` configure Atlas. If Atlas is unavailable at startup, documents are kept in a process-local development store and will be lost when the server restarts. The API health response reports the active database connection state.
@@ -43,7 +49,7 @@ Document, profile, and chat endpoints require the browser's guest session header
 
 ## Current implementation limits
 
-The UI includes landing, history, PDF Library, Ask JanSathi, language selector, persistent theme, upload, document overview, and a floating assistant. Email authentication, saved conversations, vector retrieval for long documents, automatic OCR setup, document language detection, and production deployment configuration remain future work. Atlas and live AI behavior depend on reachable services and valid credentials.
+The UI includes landing, history, PDF Library, Ask JanSathi, language selector, persistent theme, upload, document overview, and a floating assistant. Language metadata is conservatively inferred from extracted text and may remain `und` when text is sparse or OCR is ambiguous; it is not a general-purpose language identifier. Email authentication, saved conversations, vector retrieval for long documents, and automatic OCR installation remain future work. Document Overview is an extractive summary, and AI explanations may be incomplete; users should verify deadlines and eligibility with the issuing authority. The application does not make official eligibility decisions or represent a government service.
 # Mobile application
 
 The separate Expo client lives in [mobile/README.md](mobile/README.md). It uses this API and the same MongoDB / AI provider configuration; keep server secrets in the root `.env`, never the mobile app's public `EXPO_PUBLIC_API_URL` value.

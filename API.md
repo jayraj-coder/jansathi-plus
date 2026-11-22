@@ -68,13 +68,13 @@ On successful extraction, a public document response has this shape (IDs and val
   "size": 82,
   "created_at": "2026-11-21T12:00:00+00:00",
   "status": "completed",
-  "language": "und",
+  "language": "en",
   "extraction": "text",
   "overview": "Submit the form by the date printed on your notice."
 }
 ```
 
-`status` is `completed` when text was extracted, `needs_ocr` when the image/scanned-PDF OCR path could not extract text, and `no_text` for empty TXT/DOCX. `language` is currently `und` (undetermined); automatic language detection is not implemented. API response excludes the owner ID, storage path, and full extracted text.
+`status` is `completed` when text was extracted, `needs_ocr` when the image/scanned-PDF OCR path could not extract text, and `no_text` for empty TXT/DOCX. `language` is inferred from extracted text. Supported values are `en`, `hi`, `gu`, combinations such as `en+hi`, or `und` when script/language evidence is insufficient. Hindi and Gujarati are identified from Unicode scripts; English requires Latin text plus common English vocabulary. This lightweight inference is not a general-purpose language-identification model. API response excludes the owner ID, storage path, and full extracted text.
 
 ### `GET /api/documents`
 
