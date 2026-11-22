@@ -40,6 +40,9 @@ body.modal-open{overflow:hidden}
 .scanner-controls{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:9px;margin-top:17px}
 .scanner-controls .button{min-height:44px}
 .scanner-controls #scanner-fallback{margin-right:auto}
+.scanner-auto-toggle{display:flex;align-items:center;gap:9px;margin:0 0 12px;color:var(--muted);font-size:.92rem}
+.scanner-auto-toggle input{accent-color:var(--accent);width:18px;height:18px}
+.scanner-status{margin:10px 0 0;text-align:center;color:var(--muted);font-size:.9rem;min-height:1.35em}
 .doc-title{min-width:0;max-width:100%;overflow-wrap:anywhere;white-space:normal;text-align:left}
 .doc-name>span:last-child{min-width:0;overflow-wrap:anywhere}
 .doc-name button{overflow-wrap:anywhere}

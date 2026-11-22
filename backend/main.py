@@ -54,6 +54,7 @@ _OCR_UPLOAD_ID = contextvars.ContextVar("ocr_upload_id", default="unknown")
 _OCR_DEADLINE = contextvars.ContextVar("ocr_deadline", default=None)
 _OCR_TIMINGS = contextvars.ContextVar("ocr_timings", default=None)
 _TESSERACT_LOCK = threading.Lock()
+_OCR_LANGUAGE_LOCK = threading.Lock()
 _TESSERACT_CACHE = None
 _OCR_LANGUAGE_CACHE: dict[str, list[str]] = {}
 OCR_SUBPROCESS_TIMEOUT = float(os.getenv("OCR_SUBPROCESS_TIMEOUT", "25"))
@@ -61,7 +62,10 @@ OCR_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "90"))
 OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "2")))
 OCR_QUEUE_TIMEOUT = float(os.getenv("OCR_QUEUE_TIMEOUT", "10"))
 _OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
-os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+# Tesseract can start several OpenMP workers per invocation.  The upload
+# semaphore already controls process concurrency, so make the per-process CPU
+# budget deterministic even if the host image exports a larger value.
+os.environ["OMP_THREAD_LIMIT"] = "1"
 
 
 def _ocr_log(stage: str, duration: float | None = None, level: int = logging.INFO, **fields):
@@ -337,11 +341,11 @@ def configure_tesseract():
         )
         return pytesseract
 
-# OCR accuracy tuning knobs. Document upload is not on the hot request path, so
-# spending a few extra tesseract passes to pick the best result is acceptable.
+# OCR accuracy tuning knobs. PSM 6 is the primary multilingual pass; any extra
+# work is gated by low measured confidence or a strong mixed-script imbalance.
 UPSCALE_SMALL_IMAGE = True
-UPSCALE_SCALE = 2
-MIN_LONG_SIDE_FOR_UPSCALE = 1200
+UPSCALE_SCALE = 1.5
+MIN_LONG_SIDE_FOR_UPSCALE = 900
 CONFIDENCE_FLOOR = 45.0
 PSM_MODES = (6, 11, 12)  # 6: uniform block, 11: sparse text, 12: sparse text + OSD
 
@@ -453,9 +457,10 @@ def _bound_dimensions(image: Image.Image) -> Image.Image:
 def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
     """Return (name, PIL image) preprocessing variants.
 
-    The original image is preserved unchanged. Two variants target the common
-    failure modes: low resolution / low contrast. Keeping the variant count
-    small bounds the number of Tesseract subprocesses per upload.
+    The original image is preserved unchanged. A restrained 1.5x upscale and
+    contrast pass retains small glyph detail without quadrupling the pixel
+    count as a 2x resize would. Keeping the variant count small bounds the
+    number of Tesseract subprocesses per upload.
     """
     variants = [("original", image.copy())]
 
@@ -467,7 +472,7 @@ def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
     w, h = grayscale.size
     base = grayscale
     if UPSCALE_SMALL_IMAGE and max(w, h) < MIN_LONG_SIDE_FOR_UPSCALE:
-        base = grayscale.resize((w * UPSCALE_SCALE, h * UPSCALE_SCALE), Image.LANCZOS)
+        base = grayscale.resize((round(w * UPSCALE_SCALE), round(h * UPSCALE_SCALE)), Image.LANCZOS)
 
     try:
         contrasted = ImageEnhance.Contrast(base).enhance(2.0)
@@ -504,7 +509,7 @@ class OCRProcessingTimeout(TimeoutError):
     """Raised when an OCR child process reaches its enforced deadline."""
 
 
-def _run_ocr(pytesseract, image: Image.Image, config: str):
+def _run_ocr(pytesseract, image: Image.Image, config: str, purpose: str = "primary"):
     """Run one bounded Tesseract subprocess and derive both text and confidence."""
     started = time.perf_counter()
     deadline = _OCR_DEADLINE.get()
@@ -522,12 +527,13 @@ def _run_ocr(pytesseract, image: Image.Image, config: str):
         raise
     except Exception as exc:
         _ocr_log("tesseract_subprocess", time.perf_counter() - started,
-                 level=logging.ERROR, config=shlex.quote(config),
+                 level=logging.ERROR, purpose=purpose, config=shlex.quote(config),
                  timeout_s=timeout, result=type(exc).__name__)
         if isinstance(exc, RuntimeError) and "process timeout" in str(exc).lower():
             raise OCRProcessingTimeout("Tesseract subprocess timed out") from exc
         raise
-    _ocr_log("tesseract_subprocess", time.perf_counter() - started, config=shlex.quote(config),
+    _ocr_log("tesseract_subprocess", time.perf_counter() - started, purpose=purpose,
+             config=shlex.quote(config),
              timeout_s=timeout, result="ok")
     confidence = _mean_confidence(data)
     # image_to_data is a single Tesseract pass. Reconstruct normalized lines from
@@ -587,6 +593,13 @@ def _language_specific_config(base_config: str, language: str) -> str:
 
 
 def ocr_language_config(pytesseract) -> str:
+    # Serialize first-time discovery so concurrent uploads do not launch a
+    # burst of identical --list-langs subprocesses.
+    with _OCR_LANGUAGE_LOCK:
+        return _ocr_language_config_locked(pytesseract)
+
+
+def _ocr_language_config_locked(pytesseract) -> str:
     started = time.perf_counter()
     command = getattr(getattr(pytesseract, "pytesseract", None), "tesseract_cmd", "mock")
     cache_key = f"{command}|{_tessdata_config()}|{'+'.join(OCR_LANGS)}"
@@ -651,7 +664,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
             psm_started = time.perf_counter()
             try:
                 text, confidence = _run_ocr(
-                    pytesseract, variant, _psm_config(base_config, 6)
+                    pytesseract, variant, _psm_config(base_config, 6), purpose="primary_psm6"
                 )
                 logger.info("OCR upload_id=%s stage=psm_execution mode=6 confidence=%.1f chars=%d",
                             _OCR_UPLOAD_ID.get(), confidence, len(text))
@@ -668,7 +681,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
                 fallback_started = time.perf_counter()
                 try:
                     text, confidence = _run_ocr(pytesseract, variant,
-                                                _psm_config(base_config, 11))
+                                                _psm_config(base_config, 11), purpose="low_confidence_psm11")
                     logger.info("OCR upload_id=%s stage=psm_execution mode=11 confidence=%.1f chars=%d",
                                 _OCR_UPLOAD_ID.get(), confidence, len(text))
                     if confidence > best_confidence or (
@@ -676,6 +689,8 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
                     ):
                         best_text = text
                         best_confidence = confidence
+                except OCRProcessingTimeout:
+                    raise
                 except Exception as exc:
                     _ocr_log("psm_execution", level=logging.WARNING, mode=11,
                              result=type(exc).__name__)
@@ -693,6 +708,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
                     candidate_text, candidate_confidence = _run_ocr(
                         pytesseract, variant,
                         _psm_config(_language_specific_config(base_config, target_language), 6),
+                        purpose=f"script_disambiguation_{target_language}",
                     )
                     original_words = len(best_text.split())
                     candidate_words = len(candidate_text.split())

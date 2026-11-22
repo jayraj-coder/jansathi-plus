@@ -315,11 +315,11 @@ def test_pil_variants_include_all_strategies_and_preserve_original():
     assert original.size == img.size
 
 
-def test_low_resolution_image_is_upscaled_in_enhanced_variant():
+def test_low_resolution_image_uses_restrained_upscale_in_enhanced_variant():
     img = _make_image(size=(100, 50))
     variants = dict(api._pil_variants(img))
     enhanced = variants["enhanced_grayscale"]
-    assert enhanced.size == (200, 100)
+    assert enhanced.size == (150, 75)
     assert enhanced.mode == "L"
 
 
@@ -414,7 +414,7 @@ def test_extract_image_ocr_rechecks_strong_indic_script_mixture(tmp_path, monkey
     )
     seen = []
 
-    def run_ocr(_mock, _image, config):
+    def run_ocr(_mock, _image, config, **_kwargs):
         seen.append(config)
         return (combined, 80) if "-l eng+hin+guj" in config else (hindi, 75)
 

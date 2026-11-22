@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createScannerController } = require('../frontend/scanner.js');
+const { createScannerController, analyzeDocumentFrame } = require('../frontend/scanner.js');
 
 function setup({ getUserMedia, play = async () => {}, urlApi } = {}) {
   const tracks = [{ stopped: false, stop() { this.stopped = true; } }];
@@ -93,4 +93,75 @@ test('capture preparation errors stop camera tracks before offering the fallback
   assert.equal(await f.controller.capture(), false);
   assert.equal(f.tracks[0].stopped, true);
   assert.equal(f.states.at(-1).phase, 'error');
+});
+
+function syntheticFrame({ page = true, light = 80 } = {}) {
+  const width = 96, height = 128;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < width * height; i++) pixels.set([light, light, light, 255], i * 4);
+  if (page) {
+    for (let y = 14; y < 114; y++) for (let x = 15; x < 81; x++) {
+      const color = y % 13 === 0 && x > 24 && x < 72 ? 40 : 235;
+      pixels.set([color, color, color, 255], (y * width + x) * 4);
+    }
+  }
+  return { width, height, pixels };
+}
+
+test('document detector distinguishes missing page, poor light, and a well-framed page', () => {
+  const canvas = { getContext: () => ({
+    drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 110 }).pixels }; },
+  }) };
+  const video = { videoWidth: 640, videoHeight: 480 };
+  assert.equal(analyzeDocumentFrame(video, canvas, { minBrightness: 95 }).status, 'Move closer');
+  const darkCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 30 }).pixels }; } }) };
+  assert.equal(analyzeDocumentFrame(video, darkCanvas).status, 'Improve lighting');
+  const pageCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ light: 40 }).pixels }; } }) };
+  assert.equal(analyzeDocumentFrame(video, pageCanvas).status, 'Document detected');
+  assert.equal(analyzeDocumentFrame(video, pageCanvas, { minSharpness: 1e9 }).status, 'Hold steady');
+});
+
+test('Auto Capture requires stable detections for the configured frame count and duration', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:auto', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: { x: .2, y: .12, width: .6, height: .76 } }),
+    onState: state => f.states.push(state),
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { sampleIntervalMs: 100, stableFrames: 6, stableDurationMs: 700 },
+  });
+  await controller.start();
+  assert.equal(f.states.at(-1).autoCapture, true);
+  for (const time of [100, 300, 500, 700, 900]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  assert.equal(f.tracks[0].stopped, false, 'five stable samples are insufficient');
+  const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(1100);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.tracks[0].stopped, true);
+  assert.equal(f.states.at(-1).phase, 'preview');
+});
+
+test('disabling Auto Capture cancels pending analysis immediately and keeps manual capture', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, detections = 0;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:manual', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => { detections++; return { status: 'Document detected', box: { x: .2, y: .12, width: .6, height: .76 } }; },
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+  });
+  await controller.start();
+  assert.equal(controller.setAutoCapture(false), false);
+  assert.equal(callbacks.size, 0);
+  assert.equal(await controller.capture(), true);
+  assert.equal(detections, 0);
 });
