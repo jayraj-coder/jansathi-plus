@@ -14,9 +14,11 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
+import asyncio
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -372,11 +374,25 @@ def _adaptive_threshold(image: Image.Image, block_size: int = 15, offset: float 
     return Image.fromarray(binary, mode="L")
 
 
+MAX_OCR_DIMENSION = 1600
+UPLOAD_OCR_TIMEOUT = 110.0  # seconds; keeps uploads from blocking indefinitely
+
+
+def _bound_dimensions(image: Image.Image) -> Image.Image:
+    """Downscale oversized images so OCR stays bounded in CPU and memory."""
+    w, h = image.size
+    if max(w, h) > MAX_OCR_DIMENSION:
+        scale = MAX_OCR_DIMENSION / float(max(w, h))
+        return image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return image
+
+
 def _pil_variants(image: Image.Image):
     """Return (name, PIL image) preprocessing variants.
 
-    The original image is preserved unchanged. Each variant targets a different
-    failure mode: low resolution, low contrast, or text over a complex background.
+    The original image is preserved unchanged. Two variants target the common
+    failure modes: low resolution / low contrast. Keeping the variant count
+    small bounds the number of Tesseract subprocesses per upload.
     """
     variants = [("original", image.copy())]
 
@@ -386,10 +402,9 @@ def _pil_variants(image: Image.Image):
         grayscale = image
 
     w, h = grayscale.size
+    base = grayscale
     if UPSCALE_SMALL_IMAGE and max(w, h) < MIN_LONG_SIDE_FOR_UPSCALE:
         base = grayscale.resize((w * UPSCALE_SCALE, h * UPSCALE_SCALE), Image.LANCZOS)
-    else:
-        base = grayscale
 
     try:
         contrasted = ImageEnhance.Contrast(base).enhance(2.0)
@@ -459,47 +474,65 @@ def ocr_language_config(pytesseract) -> str:
 def extract_image_ocr(path: Path) -> tuple[str, str]:
     pytesseract = configure_tesseract()
     if not pytesseract:
+        logger.warning("OCR unavailable: tesseract not configured")
         return "", "ocr_unavailable"
     base_config = ocr_language_config(pytesseract)
     if not base_config:
+        logger.warning("OCR unavailable: no language models configured")
         return "", "ocr_unavailable"
     try:
         with Image.open(path) as image:
             image = image.convert("RGB")
+            image = _bound_dimensions(image)
+            variants = _pil_variants(image)
             best_text = ""
             best_confidence = -1.0
-            variants = _pil_variants(image)
 
-            # Primary pass: uniform block mode (PSM 6) across all variants.
-            for _name, variant in variants:
+            # Primary pass: PSM 6 on the cheapest, most informative variants only.
+            # This bounds Tesseract subprocesses per upload while still covering
+            # low-resolution and low-contrast failure modes.
+            for _name, variant in variants[:2]:
                 try:
                     text, confidence = _run_ocr(
                         pytesseract, variant, _psm_config(base_config, 6)
+                    )
+                    logger.info(
+                        "OCR image variant=%s psm=6 confidence=%.1f chars=%d",
+                        _name, confidence, len(text),
                     )
                     if confidence > best_confidence or (
                         confidence == best_confidence and len(text) > len(best_text)
                     ):
                         best_text = text
                         best_confidence = confidence
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "OCR image variant=%s psm=6 failed (%s).", _name, type(exc).__name__
+                    )
                     continue
 
-            # If confidence is weak, evaluate sparse-text modes (PSM 11/12).
+            # Fallback: sparse-text modes only when confidence is weak.
             if best_confidence < CONFIDENCE_FLOOR and variants:
                 _, fallback_variant = variants[0]
-                for psm in PSM_MODES:
-                    if psm == 6:
-                        continue
+                for psm in (11, 12):
                     try:
                         text, confidence = _run_ocr(
                             pytesseract, fallback_variant, _psm_config(base_config, psm)
+                        )
+                        logger.info(
+                            "OCR image variant=fallback psm=%d confidence=%.1f chars=%d",
+                            psm, confidence, len(text),
                         )
                         if confidence > best_confidence or (
                             confidence == best_confidence and len(text) > len(best_text)
                         ):
                             best_text = text
                             best_confidence = confidence
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "OCR image variant=fallback psm=%d failed (%s).",
+                            psm, type(exc).__name__,
+                        )
                         continue
 
             return _normalize_ocr_text(best_text), "ocr"
@@ -511,9 +544,11 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
 def extract_scanned_pdf(path: Path) -> tuple[str, str]:
     pytesseract = configure_tesseract()
     if not pytesseract:
+        logger.warning("OCR unavailable: tesseract not configured")
         return "", "ocr_unavailable"
     base_config = ocr_language_config(pytesseract)
     if not base_config:
+        logger.warning("OCR unavailable: no language models configured")
         return "", "ocr_unavailable"
     try:
         import pypdfium2 as pdfium
@@ -525,6 +560,7 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                 try:
                     with bitmap.to_pil() as image:
                         image = image.convert("RGB")
+                        image = _bound_dimensions(image)
                         best_text = ""
                         best_confidence = -1.0
                         for _name, variant in _pil_variants(image):
@@ -540,6 +576,10 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                             except Exception:
                                 continue
                         pages.append(_normalize_ocr_text(best_text))
+                        logger.info(
+                            "OCR pdf page=%d chars=%d confidence=%.1f",
+                            index, len(best_text), best_confidence,
+                        )
                 finally:
                     bitmap.close()
                     page.close()
@@ -634,11 +674,21 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
                 out.write(chunk)
         if not validate_signature(target, suffix):
             raise HTTPException(415, "The file content does not match its extension.")
-        text, extraction = extract_text(target, suffix)
+        logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
+        try:
+            text, extraction = await asyncio.wait_for(
+                run_in_threadpool(extract_text, target, suffix), timeout=UPLOAD_OCR_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            target.unlink(missing_ok=True)
+            logger.error("Upload %s: OCR/text extraction timed out after %ss", doc_id, UPLOAD_OCR_TIMEOUT)
+            raise HTTPException(504, "Document processing timed out. Please try a smaller or simpler file.")
         text = text[:500_000]
+        logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
         record = {"id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name, "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size, "created_at": datetime.now(timezone.utc).isoformat(), "status": status, "language": "und", "extraction": extraction, "text": text, "overview": simple_summary(text), "path": str(target)}
         save_doc(record)
+        logger.info("Upload %s: saved (status=%s)", doc_id, status)
         return public_document(record)
     except HTTPException:
         target.unlink(missing_ok=True)
