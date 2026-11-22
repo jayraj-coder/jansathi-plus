@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import shlex
+import subprocess
 import uuid
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,14 @@ OCR_LANGS = [language.strip() for language in os.getenv("TESSERACT_LANGS", "eng+
 TESSDATA_DIR = Path(os.getenv("TESSDATA_DIR", ROOT / "data" / "tessdata"))
 if not TESSDATA_DIR.is_absolute():
     TESSDATA_DIR = ROOT / TESSDATA_DIR
+logger = logging.getLogger(__name__)
+_OCR_TESSDATA_DIR: Path | None = None
+SYSTEM_TESSDATA_DIRS = (
+    Path("/usr/share/tesseract-ocr/5/tessdata"),
+    Path("/usr/share/tesseract-ocr/4.00/tessdata"),
+    Path("/usr/share/tesseract-ocr/tessdata"),
+    Path("/usr/share/tessdata"),
+)
 
 app = FastAPI(title="JanSathi API", version="1.0.0", description="Private document understanding and citizen information API")
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(","), allow_credentials=False, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["*"])
@@ -122,29 +133,160 @@ def extract_text(path: Path, suffix: str) -> tuple[str, str]:
         return "\n".join(p.text for p in doc.paragraphs), "docx_text"
     return extract_image_ocr(path)
 
+def _tessdata_candidates(executable: str | None = None) -> list[Path]:
+    explicit: list[Path] = []
+
+    configured = os.getenv("TESSDATA_DIR", "").strip()
+    if configured:
+        configured_path = Path(configured)
+        explicit.append(configured_path if configured_path.is_absolute() else ROOT / configured_path)
+
+    # Tesseract builds vary in whether TESSDATA_PREFIX denotes the data folder itself
+    # or its parent, so accept either form when it contains one of our requested models.
+    prefix = os.getenv("TESSDATA_PREFIX", "").strip()
+    if prefix:
+        prefix_path = Path(prefix)
+        explicit.extend((prefix_path, prefix_path / "tessdata"))
+
+    candidates = explicit + [TESSDATA_DIR]
+
+    if executable:
+        executable_path = Path(executable)
+        candidates.append(executable_path.parent / "tessdata")
+
+    program_files = os.getenv("ProgramFiles", r"C:\Program Files")
+    candidates.append(Path(program_files) / "Tesseract-OCR" / "tessdata")
+    candidates.extend(SYSTEM_TESSDATA_DIRS)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+
+    def available_count(path: Path) -> int:
+        return sum((path / f"{language}.traineddata").is_file() for language in OCR_LANGS)
+
+    # Valid explicit configuration always wins. Prefer a complete local model set next;
+    # among system directories, prefer the one with the most requested languages.
+    valid = [path for path in unique if path.is_dir() and available_count(path)]
+    explicit_valid = [path for path in valid if path in explicit]
+    local = TESSDATA_DIR if TESSDATA_DIR in valid else None
+    remainder = [path for path in valid if path not in explicit_valid and path != local]
+    remainder.sort(key=available_count, reverse=True)
+    ordered = explicit_valid
+    if local is not None and available_count(local) == len(OCR_LANGS):
+        ordered.append(local)
+    ordered.extend(path for path in remainder if path not in ordered)
+    if local is not None and local not in ordered:
+        ordered.append(local)
+    return ordered
+
+
+def _tesseract_candidates() -> list[str]:
+    candidates = [
+        os.getenv("TESSERACT_CMD", "").strip(),
+        str(ROOT / "tools" / "tesseract" / "tesseract.exe"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        shutil.which("tesseract") or "",
+    ]
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        found = shutil.which(candidate) or (candidate if Path(candidate).is_file() else "")
+        key = os.path.normcase(found)
+        if found and key not in seen:
+            seen.add(key)
+            resolved.append(found)
+    return resolved
+
+
+def _tessdata_config() -> str:
+    if _OCR_TESSDATA_DIR is None:
+        return ""
+    return "--tessdata-dir " + shlex.quote(_OCR_TESSDATA_DIR.as_posix())
+
+
+def _probe_default_tessdata(executable: str) -> Path | None:
+    """Ask Tesseract for its compiled-in data path without inheriting a bad override."""
+    child_env = os.environ.copy()
+    child_env.pop("TESSDATA_PREFIX", None)
+    prefix = os.getenv("TESSDATA_PREFIX", "").strip()
+    if prefix:
+        logger.warning(
+            "TESSDATA_PREFIX did not resolve to requested language files; testing Tesseract's default path without changing the process environment."
+        )
+    try:
+        result = subprocess.run(
+            [executable, "--list-langs"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+            env=child_env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Default Tesseract language-data discovery failed (%s).", type(exc).__name__)
+        return None
+
+    match = re.search(r'List of available languages in ["\']?(.+?)["\']? \(\d+\):', result.stdout)
+    if not match:
+        logger.warning("Tesseract did not report its default language-data directory.")
+        return None
+    directory = Path(match.group(1).strip().strip("\"'"))
+    if directory.is_dir() and any((directory / f"{language}.traineddata").is_file() for language in OCR_LANGS):
+        return directory
+    logger.warning("Tesseract's default data directory has no requested language models.")
+    return None
+
+
 def configure_tesseract():
+    global _OCR_TESSDATA_DIR
     try:
         import pytesseract
-        candidates = [os.getenv("TESSERACT_CMD", ""), str(ROOT / "tools" / "tesseract" / "tesseract.exe"), r"C:\Program Files\Tesseract-OCR\tesseract.exe", "tesseract"]
-        for candidate in candidates:
-            if candidate and (Path(candidate).is_file() or shutil.which(candidate)):
-                pytesseract.pytesseract.tesseract_cmd = candidate
-                break
-        if TESSDATA_DIR.is_dir():
-            os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
-        return pytesseract
-    except Exception:
+    except ImportError as exc:
+        logger.warning("OCR unavailable: pytesseract could not be imported (%s).", type(exc).__name__)
         return None
+
+    for candidate in _tesseract_candidates():
+        try:
+            result = subprocess.run(
+                [candidate, "--version"], capture_output=True, text=True, timeout=5, check=True
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Tesseract candidate failed its version check (%s).", type(exc).__name__)
+            continue
+        pytesseract.pytesseract.tesseract_cmd = candidate
+        break
+    else:
+        _OCR_TESSDATA_DIR = None
+        logger.warning("OCR unavailable: no runnable Tesseract executable was found.")
+        return None
+
+    data_dirs = _tessdata_candidates(candidate)
+    _OCR_TESSDATA_DIR = data_dirs[0] if data_dirs else _probe_default_tessdata(candidate)
+    logger.info(
+        "Tesseract ready (%s); language data directory: %s.",
+        (result.stdout or result.stderr).splitlines()[0] if (result.stdout or result.stderr) else "version unknown",
+        str(_OCR_TESSDATA_DIR) if _OCR_TESSDATA_DIR else "Tesseract default search path",
+    )
+    return pytesseract
 
 def ocr_language_config(pytesseract) -> str:
     try:
-        available = set(pytesseract.get_languages(config=""))
-    except Exception:
+        available = set(pytesseract.get_languages(config=_tessdata_config()))
+    except Exception as exc:
+        logger.warning("Tesseract language discovery failed (%s).", type(exc).__name__)
         return ""
     languages = [lang for lang in OCR_LANGS if lang in available]
     if not languages:
         return ""
-    return "-l " + "+".join(languages)
+    data_config = _tessdata_config()
+    return "-l " + "+".join(languages) + (" " + data_config if data_config else "")
 
 def extract_image_ocr(path: Path) -> tuple[str, str]:
     pytesseract = configure_tesseract()
@@ -157,7 +299,8 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
         from PIL import Image
         with Image.open(path) as image:
             return pytesseract.image_to_string(image, config=config), "ocr"
-    except Exception:
+    except Exception as exc:
+        logger.warning("Image OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
 
 def extract_scanned_pdf(path: Path) -> tuple[str, str]:
@@ -182,7 +325,8 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                     bitmap.close()
                     page.close()
         return "\n".join(pages), "pdf_ocr"
-    except Exception:
+    except Exception as exc:
+        logger.warning("Scanned PDF OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
 
 def get_ocr_languages() -> list[str]:
@@ -190,9 +334,12 @@ def get_ocr_languages() -> list[str]:
     if not pytesseract:
         return []
     try:
-        available = set(pytesseract.get_languages(config=""))
-        return [lang for lang in OCR_LANGS if lang in available]
-    except Exception:
+        available = set(pytesseract.get_languages(config=_tessdata_config()))
+        languages = [lang for lang in OCR_LANGS if lang in available]
+        logger.info("Available OCR languages: %s.", ", ".join(languages) if languages else "none")
+        return languages
+    except Exception as exc:
+        logger.warning("Tesseract language detection failed (%s).", type(exc).__name__)
         return []
 
 def validate_signature(path: Path, suffix: str) -> bool:
