@@ -394,6 +394,37 @@ def test_extract_image_ocr_falls_back_to_sparse_psm_when_confidence_low(tmp_path
     assert text == "MAN SEEKS PEACE"
 
 
+def test_extract_image_ocr_rechecks_strong_indic_script_mixture(tmp_path, monkeypatch):
+    image_path = tmp_path / "indic.png"
+    _make_image(size=(300, 120)).save(image_path)
+    mock = _mock_pytesseract({6: ("placeholder", 80)})
+    monkeypatch.setattr(api, "configure_tesseract", lambda: mock)
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    combined = (
+        "\u0ab8\u0abe\u0ab0\u0acd\u0a96\u0aa8\u0a9c\u0abf "
+        "\u0938\u0942\u091a\u0928\u093e \u0938\u094d\u0935\u093e\u0938\u094d\u0925\u094d\u092f "
+        "\u0936\u093f\u0935\u093f\u0930 \u0906\u0935\u0947\u0926\u0928 \u0915\u0940 "
+        "\u0905\u0902\u0924\u093f\u092e \u0aa4\u0aa5\u0abe 30 \u091c\u0942\u0928 2027"
+    )
+    hindi = (
+        "\u0938\u093e\u0930\u094d\u0935\u091c\u0928\u093f\u0915 \u0938\u0942\u091a\u0928\u093e "
+        "\u0938\u094d\u0935\u093e\u0938\u094d\u0925\u094d\u092f \u0936\u093f\u0935\u093f\u0930 "
+        "\u0906\u0935\u0947\u0926\u0928 \u0915\u0940 \u0905\u0902\u0924\u093f\u092e "
+        "\u0924\u093f\u0925\u093f 30 \u091c\u0942\u0928 2027"
+    )
+    seen = []
+
+    def run_ocr(_mock, _image, config):
+        seen.append(config)
+        return (combined, 80) if "-l eng+hin+guj" in config else (hindi, 75)
+
+    monkeypatch.setattr(api, "_run_ocr", run_ocr)
+    text, label = api.extract_image_ocr(image_path)
+    assert label == "ocr"
+    assert text == hindi
+    assert seen == ["-l eng+hin+guj --psm 6", "-l hin --psm 6"]
+
+
 def test_single_tsv_pass_provides_text_and_numeric_confidence(monkeypatch):
     mock = _mock_pytesseract({6: ("JANSAATHI PLUS", 83)})
     monkeypatch.setattr(api, "OCR_SUBPROCESS_TIMEOUT", 1)

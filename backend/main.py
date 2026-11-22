@@ -554,6 +554,34 @@ def _normalize_ocr_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _indic_script_counts(text: str) -> dict[str, int]:
+    letters = [character for character in text
+               if unicodedata.category(character).startswith("L")]
+    return {
+        "hin": sum("\u0900" <= character <= "\u097f" for character in letters),
+        "guj": sum("\u0a80" <= character <= "\u0aff" for character in letters),
+    }
+
+
+def _dominant_indic_language(text: str) -> str | None:
+    counts = _indic_script_counts(text)
+    if not all(counts.values()):
+        return None
+    dominant, minority = sorted(counts.values(), reverse=True)
+    if dominant >= minority * 2.5:
+        return "hin" if counts["hin"] == dominant else "guj"
+    return None
+
+
+def _language_specific_config(base_config: str, language: str) -> str:
+    parts = shlex.split(base_config)
+    try:
+        parts[parts.index("-l") + 1] = language
+    except (ValueError, IndexError):
+        return base_config
+    return shlex.join(parts)
+
+
 def ocr_language_config(pytesseract) -> str:
     started = time.perf_counter()
     command = getattr(getattr(pytesseract, "pytesseract", None), "tesseract_cmd", "mock")
@@ -650,6 +678,36 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
                 finally:
                     _ocr_log("psm_execution", time.perf_counter() - fallback_started, mode=11)
 
+            # Combined Indic models can occasionally confuse a few characters
+            # between Devanagari and Gujarati. Re-run only when the recognized
+            # output itself shows a strong script imbalance, then keep the
+            # candidate only if confidence and text coverage remain comparable.
+            target_language = _dominant_indic_language(best_text)
+            if target_language:
+                language_started = time.perf_counter()
+                try:
+                    candidate_text, candidate_confidence = _run_ocr(
+                        pytesseract, variant,
+                        _psm_config(_language_specific_config(base_config, target_language), 6),
+                    )
+                    original_words = len(best_text.split())
+                    candidate_words = len(candidate_text.split())
+                    if (candidate_text and candidate_words >= max(3, int(original_words * 0.6))
+                            and candidate_confidence >= best_confidence - 15):
+                        best_text, best_confidence = candidate_text, candidate_confidence
+                        selected = "language_specific"
+                    else:
+                        selected = "combined"
+                    _ocr_log("language_disambiguation", time.perf_counter() - language_started,
+                             target=target_language, selected=selected,
+                             confidence=f"{candidate_confidence:.1f}", words=candidate_words)
+                except OCRProcessingTimeout:
+                    raise
+                except Exception as exc:
+                    _ocr_log("language_disambiguation", time.perf_counter() - language_started,
+                             level=logging.WARNING, target=target_language,
+                             result=type(exc).__name__)
+
             normalization_started = time.perf_counter()
             normalized = _normalize_ocr_text(best_text)
             _ocr_log("text_normalization", time.perf_counter() - normalization_started,
@@ -720,6 +778,30 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                                 except Exception as exc:
                                     _ocr_log("psm_execution", level=logging.WARNING,
                                              pdf_page=index + 1, mode=11, result=type(exc).__name__)
+                            target_language = _dominant_indic_language(best_text)
+                            if target_language:
+                                language_started = time.perf_counter()
+                                try:
+                                    candidate_text, candidate_confidence = _run_ocr(
+                                        pytesseract, variant,
+                                        _psm_config(_language_specific_config(base_config, target_language), 6),
+                                    )
+                                    if (candidate_text
+                                            and len(candidate_text.split()) >= max(3, int(len(best_text.split()) * 0.6))
+                                            and candidate_confidence >= best_confidence - 15):
+                                        best_text, best_confidence = candidate_text, candidate_confidence
+                                        selected = "language_specific"
+                                    else:
+                                        selected = "combined"
+                                    _ocr_log("language_disambiguation", time.perf_counter() - language_started,
+                                             pdf_page=index + 1, target=target_language,
+                                             selected=selected, confidence=f"{candidate_confidence:.1f}")
+                                except OCRProcessingTimeout:
+                                    raise
+                                except Exception as exc:
+                                    _ocr_log("language_disambiguation", time.perf_counter() - language_started,
+                                             level=logging.WARNING, pdf_page=index + 1,
+                                             target=target_language, result=type(exc).__name__)
                         pages.append(_normalize_ocr_text(best_text))
                         _ocr_log("pdf_page_ocr", time.perf_counter() - page_started,
                                  pdf_page=index + 1, chars=len(best_text),
