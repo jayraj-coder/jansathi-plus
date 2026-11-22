@@ -19,29 +19,43 @@
     canvas.height = cfg.height;
     const context = canvas.getContext('2d', { willReadFrequently: true });
     if (!context) return { status: 'Position your document inside the frame' };
-    try { context.drawImage(video, 0, 0, cfg.width, cfg.height); }
+    const scale = Math.min(cfg.width / video.videoWidth, cfg.height / video.videoHeight);
+    const drawWidth = Math.max(1, Math.round(video.videoWidth * scale));
+    const drawHeight = Math.max(1, Math.round(video.videoHeight * scale));
+    const active = {
+      left: Math.floor((cfg.width - drawWidth) / 2),
+      top: Math.floor((cfg.height - drawHeight) / 2),
+      width: drawWidth, height: drawHeight,
+    };
+    active.right = active.left + active.width;
+    active.bottom = active.top + active.height;
+    const activeArea = active.width * active.height;
+    try {
+      context.clearRect(0, 0, cfg.width, cfg.height);
+      context.drawImage(video, active.left, active.top, active.width, active.height);
+    }
     catch { return { status: 'Position your document inside the frame' }; }
     const { data } = context.getImageData(0, 0, cfg.width, cfg.height);
     const total = cfg.width * cfg.height;
     const histogram = new Uint32Array(256);
     const gray = new Uint8Array(total);
     let frameLight = 0;
-    for (let i = 0; i < total; i++) {
-      const p = i * 4;
+    for (let y = active.top; y < active.bottom; y++) for (let x = active.left; x < active.right; x++) {
+      const i = y * cfg.width + x, p = i * 4;
       const r = data[p], g = data[p + 1], b = data[p + 2];
-      const y = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-      gray[i] = y;
-      frameLight += y;
-      histogram[y]++;
+      const luminance = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+      gray[i] = luminance;
+      frameLight += luminance;
+      histogram[luminance]++;
     }
-    if (frameLight / total < cfg.minBrightness) return { status: 'Improve lighting' };
+    if (frameLight / activeArea < cfg.minBrightness) return { status: 'Improve lighting' };
 
     let sumAll = 0, sumBackground = 0, weightBackground = 0, bestVariance = -1, otsu = 128;
     for (let i = 0; i < 256; i++) sumAll += i * histogram[i];
     for (let i = 0; i < 256; i++) {
       weightBackground += histogram[i];
       if (!weightBackground) continue;
-      const weightForeground = total - weightBackground;
+      const weightForeground = activeArea - weightBackground;
       if (!weightForeground) break;
       sumBackground += i * histogram[i];
       const meanBackground = sumBackground / weightBackground;
@@ -51,7 +65,10 @@
     }
     const threshold = Math.max(105, Math.min(220, otsu + 12));
     const mask = new Uint8Array(total);
-    for (let i = 0; i < total; i++) if (gray[i] >= threshold) mask[i] = 1;
+    for (let y = active.top; y < active.bottom; y++) for (let x = active.left; x < active.right; x++) {
+      const i = y * cfg.width + x;
+      if (gray[i] >= threshold) mask[i] = 1;
+    }
 
     const seen = new Uint8Array(total);
     const regions = [];
@@ -73,7 +90,7 @@
         if (up >= 0 && mask[up] && !seen[up]) { seen[up] = 1; stack[top++] = up; }
         if (down >= 0 && mask[down] && !seen[down]) { seen[down] = 1; stack[top++] = down; }
       }
-      if (count / total >= 0.035) regions.push({ minX, minY, maxX, maxY, count });
+      if (count / activeArea >= 0.035) regions.push({ minX, minY, maxX, maxY, count });
     }
     if (!regions.length) return { status: 'Looking for document...' };
 
@@ -86,7 +103,7 @@
       const gapX = Math.max(0, Math.max(first.minX, second.minX) - Math.min(first.maxX, second.maxX) - 1);
       const overlapY = Math.max(0, Math.min(first.maxY, second.maxY) - Math.max(first.minY, second.minY) + 1);
       const sharedHeight = overlapY / Math.max(1, Math.min(first.maxY - first.minY + 1, second.maxY - second.minY + 1));
-      if (gapX <= cfg.width * 0.1 && sharedHeight >= 0.55) candidates.push({
+      if (gapX <= active.width * 0.1 && sharedHeight >= 0.55) candidates.push({
         minX: Math.min(first.minX, second.minX), minY: Math.min(first.minY, second.minY),
         maxX: Math.max(first.maxX, second.maxX), maxY: Math.max(first.maxY, second.maxY),
         count: first.count + second.count,
@@ -96,15 +113,16 @@
     let best = null;
     for (const region of candidates) {
       const width = region.maxX - region.minX + 1, height = region.maxY - region.minY + 1;
-      const aspect = width / height, boxArea = width * height / total;
+      const aspect = width / height, boxArea = width * height / activeArea;
       if (boxArea < cfg.minArea || boxArea > cfg.maxArea || aspect < 0.32 || aspect > 2.65) continue;
-      const box = { x: region.minX / cfg.width, y: region.minY / cfg.height,
-        width: width / cfg.width, height: height / cfg.height };
-      if (region.minX < 2 || region.minY < 2 || region.maxX >= cfg.width - 2 || region.maxY >= cfg.height - 2 ||
+      const box = { x: (region.minX - active.left) / active.width, y: (region.minY - active.top) / active.height,
+        width: width / active.width, height: height / active.height };
+      if (region.minX < active.left + 2 || region.minY < active.top + 2 ||
+          region.maxX >= active.right - 2 || region.maxY >= active.bottom - 2 ||
           box.x < 0.06 || box.x + box.width > 0.94 || box.y < 0.05 || box.y + box.height > 0.95) continue;
       if (!best || boxArea > best.area) best = { ...region, box, area: boxArea };
     }
-    if (!best) return regions.some(region => region.count / total < cfg.minArea)
+    if (!best) return regions.some(region => region.count / activeArea < cfg.minArea)
       ? { status: 'Move closer' } : { status: 'Position your document inside the frame' };
 
     const { minX, minY, maxX, maxY, box } = best;

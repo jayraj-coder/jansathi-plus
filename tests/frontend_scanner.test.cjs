@@ -110,13 +110,13 @@ function syntheticFrame({ page = true, light = 80 } = {}) {
 
 test('document detector distinguishes missing page, poor light, and a well-framed page', () => {
   const canvas = { getContext: () => ({
-    drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 110 }).pixels }; },
+    clearRect() {}, drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 110 }).pixels }; },
   }) };
-  const video = { videoWidth: 640, videoHeight: 480 };
+  const video = { videoWidth: 480, videoHeight: 640 };
   assert.equal(analyzeDocumentFrame(video, canvas, { minBrightness: 95 }).status, 'Looking for document...');
-  const darkCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 30 }).pixels }; } }) };
+  const darkCanvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 30 }).pixels }; } }) };
   assert.equal(analyzeDocumentFrame(video, darkCanvas).status, 'Improve lighting');
-  const pageCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ light: 40 }).pixels }; } }) };
+  const pageCanvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: syntheticFrame({ light: 40 }).pixels }; } }) };
   assert.equal(analyzeDocumentFrame(video, pageCanvas).status, 'Document detected');
   assert.equal(analyzeDocumentFrame(video, pageCanvas, { minSharpness: 1e9 }).status, 'Image is blurry');
   assert.equal(analyzeDocumentFrame(video, pageCanvas, { minArea: .55 }).status, 'Move closer');
@@ -133,10 +133,19 @@ test('detector finds an open textbook spread across a dark central gutter', () =
       pixels.set([shade, shade - 4, shade - 10, 255], (y * width + x) * 4);
     }
   }
-  const canvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: pixels }; } }) };
-  const result = analyzeDocumentFrame({ videoWidth: 1280, videoHeight: 720 }, canvas);
-  assert.equal(result.status, 'Document detected');
+  const canvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: pixels }; } }) };
+  const result = analyzeDocumentFrame({ videoWidth: 480, videoHeight: 640 }, canvas);
+  assert.equal(result.status, 'Document detected', JSON.stringify(result));
   assert.ok(result.box.width > .7, 'the two page regions merge into a spread-sized region');
+});
+
+test('detector preserves landscape camera aspect ratio without cropping the frame', () => {
+  let drawArgs;
+  const pixels = new Uint8ClampedArray(112 * 144 * 4);
+  for (let i = 0; i < 112 * 144; i++) pixels.set([120, 120, 120, 255], i * 4);
+  const canvas = { getContext: () => ({ clearRect() {}, drawImage(...args) { drawArgs = args; }, getImageData() { return { data: pixels }; } }) };
+  analyzeDocumentFrame({ videoWidth: 1280, videoHeight: 720 }, canvas);
+  assert.deepEqual(drawArgs.slice(1), [0, 40, 112, 63]);
 });
 
 test('Auto Capture requires stable detections for the configured frame count and duration', async () => {
