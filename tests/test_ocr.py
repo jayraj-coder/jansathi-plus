@@ -749,6 +749,25 @@ def test_upload_ocr_subprocess_deadline_returns_504(tmp_path, monkeypatch):
     assert "OCR timed out" in response.json()["detail"]
 
 
+def test_upload_response_includes_measured_server_timing_stages(tmp_path, monkeypatch):
+    def timed_extract(path, suffix):
+        api._ocr_log("image_preprocessing", 0.012)
+        api._ocr_log("tesseract_subprocess", 0.34)
+        api._ocr_log("total_ocr_execution", 0.37)
+        return "PUBLIC NOTICE", "ocr"
+
+    monkeypatch.setattr(api, "extract_text", timed_extract)
+    client = TestClient(api.app)
+    image = _make_upload_file(tmp_path, "notice.jpg", b"\xff\xd8\xff\xe0fake jpg")
+    with image.open("rb") as stream:
+        response = client.post("/api/documents", files={"file": (image.name, stream, "image/jpeg")}, headers=GUEST)
+    assert response.status_code == 200
+    timing = response.headers["server-timing"]
+    assert "ocr-image-preprocessing;dur=12.0" in timing
+    assert "ocr-tesseract-subprocess;dur=340.0" in timing
+    assert "ocr-total-ocr-execution;dur=370.0" in timing
+
+
 def test_upload_ocr_subprocess_failure_returns_422(tmp_path, monkeypatch):
     def _boom(path, suffix):
         raise RuntimeError("tesseract crashed")

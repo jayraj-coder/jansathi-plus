@@ -22,7 +22,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 import asyncio
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response
 from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -52,6 +52,7 @@ SYSTEM_TESSDATA_DIRS = (
 )
 _OCR_UPLOAD_ID = contextvars.ContextVar("ocr_upload_id", default="unknown")
 _OCR_DEADLINE = contextvars.ContextVar("ocr_deadline", default=None)
+_OCR_TIMINGS = contextvars.ContextVar("ocr_timings", default=None)
 _TESSERACT_LOCK = threading.Lock()
 _TESSERACT_CACHE = None
 _OCR_LANGUAGE_CACHE: dict[str, list[str]] = {}
@@ -64,6 +65,9 @@ os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 
 def _ocr_log(stage: str, duration: float | None = None, level: int = logging.INFO, **fields):
+    timings = _OCR_TIMINGS.get()
+    if duration is not None and timings is not None:
+        timings[stage] = timings.get(stage, 0.0) + duration * 1000
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     elapsed = f" duration_ms={duration * 1000:.1f}" if duration is not None else ""
     logger.log(level, "OCR upload_id=%s stage=%s%s%s", _OCR_UPLOAD_ID.get(), stage, elapsed,
@@ -932,7 +936,7 @@ def profile_update(body: ProfileUpdate, request: Request):
     return {"first_name": values["first_name"], "last_name": values["last_name"], "email": None, "language": values["language"], "theme": values["theme"], "has_profile": True}
 
 @app.post("/api/documents")
-async def upload_document(request: Request, file: UploadFile = File(...)):
+async def upload_document(request: Request, response: Response, file: UploadFile = File(...)):
     owner_id = owner(request)
     name = Path(file.filename or "document").name
     suffix = Path(name).suffix.lower()
@@ -954,6 +958,8 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
         logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
         upload_context = _OCR_UPLOAD_ID.set(doc_id)
         deadline_context = _OCR_DEADLINE.set(time.perf_counter() + OCR_DOCUMENT_TIMEOUT)
+        timings: dict[str, float] = {}
+        timings_context = _OCR_TIMINGS.set(timings)
         try:
             text, extraction = await asyncio.wait_for(
                 run_in_threadpool(extract_text, target, suffix), timeout=UPLOAD_OCR_TIMEOUT
@@ -969,12 +975,18 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
         finally:
             _OCR_UPLOAD_ID.reset(upload_context)
             _OCR_DEADLINE.reset(deadline_context)
+            _OCR_TIMINGS.reset(timings_context)
         text = text[:500_000]
         logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
         record = {"id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name, "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size, "created_at": datetime.now(timezone.utc).isoformat(), "status": status, "language": detect_document_language(text), "extraction": extraction, "text": text, "overview": simple_summary(text), "path": str(target)}
         save_doc(record)
         logger.info("Upload %s: saved (status=%s)", doc_id, status)
+        if timings:
+            response.headers["Server-Timing"] = ", ".join(
+                f"ocr-{stage.replace('_', '-')};dur={duration_ms:.1f}"
+                for stage, duration_ms in sorted(timings.items())
+            )
         return public_document(record)
     except HTTPException:
         target.unlink(missing_ok=True)

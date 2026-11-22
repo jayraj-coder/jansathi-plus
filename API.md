@@ -76,6 +76,8 @@ On successful extraction, a public document response has this shape (IDs and val
 
 `status` is `completed` when text was extracted, `needs_ocr` when the image/scanned-PDF OCR path could not extract text, and `no_text` for empty TXT/DOCX. `language` is inferred from extracted text. Supported values are `en`, `hi`, `gu`, combinations such as `en+hi`, or `und` when script/language evidence is insufficient. Hindi and Gujarati are identified from Unicode scripts; English requires Latin text plus common English vocabulary. This lightweight inference is not a general-purpose language-identification model. API response excludes the owner ID, storage path, and full extracted text.
 
+OCR upload responses also include a `Server-Timing` header with measured `ocr-*` durations in milliseconds when timing data is available. Multi-page PDF values aggregate across processed pages and subprocesses.
+
 ### `GET /api/documents`
 
 Optional query parameters: `q` (case-insensitive title substring) and `kind=pdf` (PDF-only filter). Returns a newest-first JSON array of the same public metadata schema as upload; limited to 500 records per guest.
