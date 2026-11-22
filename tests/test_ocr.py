@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from backend import main as api
+
+
+@pytest.fixture(autouse=True)
+def reset_ocr_process_caches():
+    api._TESSERACT_CACHE = None
+    api._OCR_LANGUAGE_CACHE.clear()
+    yield
+    api._TESSERACT_CACHE = None
+    api._OCR_LANGUAGE_CACHE.clear()
 
 
 def _write_models(directory: Path, *languages: str) -> Path:
@@ -229,23 +243,18 @@ def _mock_pytesseract(psm_text_conf):
     """psm_text_conf: {psm: (text, confidence)}"""
     m = SimpleNamespace()
 
-    def image_to_string(image, config=""):
-        for psm, (text, _conf) in psm_text_conf.items():
+    def image_to_data(image, config="", output_type=None, timeout=None):
+        for psm, (text, conf) in psm_text_conf.items():
             if f"--psm {psm}" in config:
-                return text
-        return ""
+                words = text.split()
+                return {"text": words, "conf": [str(conf)] * len(words),
+                        "page_num": ["1"] * len(words), "block_num": ["1"] * len(words),
+                        "par_num": ["1"] * len(words),
+                        "line_num": ["1"] * len(words)}
+        return {"text": [], "conf": [], "page_num": [], "block_num": [],
+                "par_num": [], "line_num": []}
 
-    def image_to_data(image, config="", output_type=None):
-        for psm, (_text, conf) in psm_text_conf.items():
-            if f"--psm {psm}" in config:
-                class Data:
-                    conf = [conf, conf, conf]
-                return Data()
-        class Data:
-            conf = []
-        return Data()
-
-    m.image_to_string = image_to_string
+    m.Output = SimpleNamespace(DICT="dict")
     m.image_to_data = image_to_data
     m.get_languages = lambda config="": ["eng", "hin", "guj", "osd"]
     return m
@@ -367,6 +376,65 @@ def test_extract_image_ocr_falls_back_to_sparse_psm_when_confidence_low(tmp_path
     text, label = api.extract_image_ocr(tmp_path / "doc.png")
     assert label == "ocr"
     assert text == "MAN SEEKS PEACE"
+
+
+def test_single_tsv_pass_provides_text_and_numeric_confidence(monkeypatch):
+    mock = _mock_pytesseract({6: ("JANSAATHI PLUS", 83)})
+    monkeypatch.setattr(api, "OCR_SUBPROCESS_TIMEOUT", 1)
+    text, confidence = api._run_ocr(mock, _make_image(), "-l eng --psm 6")
+    assert text == "JANSAATHI PLUS"
+    assert confidence == 83
+
+
+def test_real_tesseract_subprocess_timeout_terminates_process_and_cleans_temp_files(tmp_path, monkeypatch):
+    import pytesseract
+    import tempfile
+
+    pid_file = tmp_path / "child.pid"
+    compiler = shutil.which("gcc")
+    if not compiler:
+        pytest.skip("gcc is required to build the test Tesseract executable")
+    source = tmp_path / "slow_tesseract.c"
+    source.write_text(r'''#include <stdio.h>
+#include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#define CURRENT_PID GetCurrentProcessId
+#define WAIT_FOREVER() Sleep(30000)
+#else
+#include <unistd.h>
+#define CURRENT_PID getpid
+#define WAIT_FOREVER() sleep(30)
+#endif
+int main(void) {
+  FILE *file = fopen(getenv("OCR_TEST_PID_FILE"), "w");
+  fprintf(file, "%ld", (long) CURRENT_PID());
+  fclose(file);
+  WAIT_FOREVER();
+  return 0;
+}
+''')
+    executable = tmp_path / ("slow-tesseract.exe" if os.name == "nt" else "slow-tesseract")
+    try:
+        subprocess.run([compiler, str(source), "-o", str(executable)], check=True,
+                       capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        pytest.skip("gcc is installed but cannot link the test executable on this host")
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(executable))
+    monkeypatch.setattr(api, "OCR_SUBPROCESS_TIMEOUT", 0.5)
+    monkeypatch.setenv("OCR_TEST_PID_FILE", str(pid_file))
+    image = Image.new("RGB", (20, 20), "white")
+    temp_dir = Path(tempfile.gettempdir())
+    temp_before = {p.name for p in temp_dir.glob("tess_*")}
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="timeout"):
+        api._run_ocr(pytesseract, image, "-l eng --psm 6")
+    assert time.monotonic() - started < 5
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert {p.name for p in temp_dir.glob("tess_*")} == temp_before
 
 
 def test_ocr_language_config_reports_english_hindi_gujarati(monkeypatch):
@@ -553,6 +621,35 @@ def test_upload_sequential_uploads_get_unique_ids(tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         ids.append(r.json()["id"])
     assert ids[0] != ids[1]
+
+
+def test_concurrent_uploads_and_list_keep_event_loop_responsive(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    import httpx
+
+    def slow_extract(path, suffix):
+        time.sleep(0.25)
+        return "concurrent OCR", "ocr"
+
+    monkeypatch.setattr(api, "extract_text", slow_extract)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async def upload(name):
+                return await client.post("/api/documents", headers=GUEST,
+                                         files={"file": (name, b"\xff\xd8\xffimage", "image/jpeg")})
+            first = asyncio.create_task(upload("first.jpg"))
+            second = asyncio.create_task(upload("second.jpg"))
+            await asyncio.sleep(0.05)
+            response = await client.get("/api/documents", headers=GUEST)
+            assert response.status_code == 200
+            a, b = await asyncio.gather(first, second)
+            assert a.status_code == b.status_code == 200
+            assert a.json()["id"] != b.json()["id"]
+
+    asyncio.run(exercise())
 
 
 def test_upload_response_preserves_full_text(tmp_path, monkeypatch):

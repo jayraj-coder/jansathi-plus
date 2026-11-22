@@ -7,6 +7,9 @@ import shlex
 import subprocess
 import uuid
 import logging
+import contextvars
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +48,21 @@ SYSTEM_TESSDATA_DIRS = (
     Path("/usr/share/tesseract-ocr/tessdata"),
     Path("/usr/share/tessdata"),
 )
+_OCR_UPLOAD_ID = contextvars.ContextVar("ocr_upload_id", default="unknown")
+_TESSERACT_LOCK = threading.Lock()
+_TESSERACT_CACHE = None
+_OCR_LANGUAGE_CACHE: dict[str, list[str]] = {}
+OCR_SUBPROCESS_TIMEOUT = float(os.getenv("OCR_SUBPROCESS_TIMEOUT", "25"))
+OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "2")))
+_OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+
+def _ocr_log(stage: str, duration: float | None = None, level: int = logging.INFO, **fields):
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    elapsed = f" duration_ms={duration * 1000:.1f}" if duration is not None else ""
+    logger.log(level, "OCR upload_id=%s stage=%s%s%s", _OCR_UPLOAD_ID.get(), stage, elapsed,
+               f" {details}" if details else "")
 
 app = FastAPI(title="JanSathi API", version="1.0.0", description="Private document understanding and citizen information API")
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(","), allow_credentials=False, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["*"])
@@ -250,36 +268,51 @@ def _probe_default_tessdata(executable: str) -> Path | None:
 
 
 def configure_tesseract():
-    global _OCR_TESSDATA_DIR
+    global _OCR_TESSDATA_DIR, _TESSERACT_CACHE
     try:
         import pytesseract
     except ImportError as exc:
         logger.warning("OCR unavailable: pytesseract could not be imported (%s).", type(exc).__name__)
         return None
 
-    for candidate in _tesseract_candidates():
-        try:
-            result = subprocess.run(
-                [candidate, "--version"], capture_output=True, text=True, timeout=5, check=True
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("Tesseract candidate failed its version check (%s).", type(exc).__name__)
-            continue
-        pytesseract.pytesseract.tesseract_cmd = candidate
-        break
-    else:
-        _OCR_TESSDATA_DIR = None
-        logger.warning("OCR unavailable: no runnable Tesseract executable was found.")
-        return None
+    if _TESSERACT_CACHE is not None:
+        pytesseract.pytesseract.tesseract_cmd, _OCR_TESSDATA_DIR = _TESSERACT_CACHE
+        _ocr_log("tesseract_discovery", 0, cache="hit")
+        return pytesseract
 
-    data_dirs = _tessdata_candidates(candidate)
-    _OCR_TESSDATA_DIR = data_dirs[0] if data_dirs else _probe_default_tessdata(candidate)
-    logger.info(
-        "Tesseract ready (%s); language data directory: %s.",
-        (result.stdout or result.stderr).splitlines()[0] if (result.stdout or result.stderr) else "version unknown",
-        str(_OCR_TESSDATA_DIR) if _OCR_TESSDATA_DIR else "Tesseract default search path",
-    )
-    return pytesseract
+    with _TESSERACT_LOCK:
+        if _TESSERACT_CACHE is not None:
+            pytesseract.pytesseract.tesseract_cmd, _OCR_TESSDATA_DIR = _TESSERACT_CACHE
+            _ocr_log("tesseract_discovery", 0, cache="hit")
+            return pytesseract
+        started = time.perf_counter()
+        for candidate in _tesseract_candidates():
+            try:
+                result = subprocess.run(
+                    [candidate, "--version"], capture_output=True, text=True, timeout=5, check=True
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("Tesseract candidate failed its version check (%s).", type(exc).__name__)
+                continue
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            break
+        else:
+            _OCR_TESSDATA_DIR = None
+            _ocr_log("tesseract_discovery", time.perf_counter() - started, level=logging.WARNING, result="missing")
+            logger.warning("OCR unavailable: no runnable Tesseract executable was found.")
+            return None
+
+        data_dirs = _tessdata_candidates(candidate)
+        _OCR_TESSDATA_DIR = data_dirs[0] if data_dirs else _probe_default_tessdata(candidate)
+        _TESSERACT_CACHE = (candidate, _OCR_TESSDATA_DIR)
+        _ocr_log("tesseract_discovery", time.perf_counter() - started, executable=candidate,
+                 tessdata=str(_OCR_TESSDATA_DIR or "default"))
+        logger.info(
+            "Tesseract ready (%s); language data directory: %s.",
+            (result.stdout or result.stderr).splitlines()[0] if (result.stdout or result.stderr) else "version unknown",
+            str(_OCR_TESSDATA_DIR) if _OCR_TESSDATA_DIR else "Tesseract default search path",
+        )
+        return pytesseract
 
 # OCR accuracy tuning knobs. Document upload is not on the hot request path, so
 # spending a few extra tesseract passes to pick the best result is acceptable.
@@ -331,7 +364,14 @@ def wer(reference: str, hypothesis: str) -> float:
 
 
 def _mean_confidence(data: dict) -> float:
-    confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c >= 0]
+    confs = []
+    for value in data.get("conf", []):
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            continue
+        if confidence >= 0:
+            confs.append(confidence)
     if not confs:
         return 0.0
     return sum(confs) / len(confs)
@@ -387,7 +427,7 @@ def _bound_dimensions(image: Image.Image) -> Image.Image:
     return image
 
 
-def _pil_variants(image: Image.Image):
+def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
     """Return (name, PIL image) preprocessing variants.
 
     The original image is preserved unchanged. Two variants target the common
@@ -416,6 +456,9 @@ def _pil_variants(image: Image.Image):
     except Exception:
         denoised = contrasted
 
+    if not include_fallbacks:
+        return [("enhanced_grayscale", denoised)]
+
     variants.append(("enhanced_grayscale", denoised))
 
     try:
@@ -435,16 +478,36 @@ def _psm_config(base_config: str, psm: int) -> str:
 
 
 def _run_ocr(pytesseract, image: Image.Image, config: str):
-    """Run one OCR pass; return (text, mean_confidence)."""
-    text = pytesseract.image_to_string(image, config=config)
+    """Run one bounded Tesseract subprocess and derive both text and confidence."""
+    started = time.perf_counter()
     try:
         data = pytesseract.image_to_data(
-            image, config=config, output_type=pytesseract.Output.DICT
+            image, config=config, output_type=pytesseract.Output.DICT,
+            timeout=OCR_SUBPROCESS_TIMEOUT,
         )
-        confidence = _mean_confidence(data)
-    except Exception:
-        confidence = 0.0
-    return text, confidence
+    except Exception as exc:
+        _ocr_log("tesseract_subprocess", time.perf_counter() - started,
+                 level=logging.ERROR, config=shlex.quote(config),
+                 timeout_s=OCR_SUBPROCESS_TIMEOUT, result=type(exc).__name__)
+        raise
+    _ocr_log("tesseract_subprocess", time.perf_counter() - started, config=shlex.quote(config),
+             timeout_s=OCR_SUBPROCESS_TIMEOUT, result="ok")
+    confidence = _mean_confidence(data)
+    # image_to_data is a single Tesseract pass. Reconstruct normalized lines from
+    # the returned words so text and confidence describe the same recognition run.
+    grouped: dict[tuple[str, str, str, str], list[str]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for i, word in enumerate(data.get("text", [])):
+        word = str(word).strip()
+        if not word:
+            continue
+        key = tuple(str(data.get(field, [""] * (i + 1))[i]) for field in
+                    ("page_num", "block_num", "par_num", "line_num"))
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(word)
+    return "\n".join(" ".join(grouped[key]) for key in order), confidence
 
 
 def _normalize_ocr_text(text: str) -> str:
@@ -459,12 +522,34 @@ def _normalize_ocr_text(text: str) -> str:
 
 
 def ocr_language_config(pytesseract) -> str:
+    started = time.perf_counter()
+    command = getattr(getattr(pytesseract, "pytesseract", None), "tesseract_cmd", "mock")
+    cache_key = f"{command}|{_tessdata_config()}|{'+'.join(OCR_LANGS)}"
+    if cache_key in _OCR_LANGUAGE_CACHE:
+        languages = _OCR_LANGUAGE_CACHE[cache_key]
+        _ocr_log("language_initialization", 0, cache="hit",
+                 languages="+".join(languages) if languages else "none")
+        data_config = _tessdata_config()
+        return "-l " + "+".join(languages) + (" " + data_config if data_config else "") if languages else ""
     try:
-        available = set(pytesseract.get_languages(config=_tessdata_config()))
+        if command != "mock":
+            argv = [command, "--list-langs"]
+            if _OCR_TESSDATA_DIR:
+                argv.extend(("--tessdata-dir", str(_OCR_TESSDATA_DIR)))
+            result = subprocess.run(argv, capture_output=True, text=True,
+                                    timeout=10, check=True)
+            available = set((result.stdout or "").splitlines()[1:])
+        else:
+            available = set(pytesseract.get_languages(config=_tessdata_config()))
     except Exception as exc:
+        _ocr_log("language_initialization", time.perf_counter() - started,
+                 level=logging.WARNING, result=type(exc).__name__)
         logger.warning("Tesseract language discovery failed (%s).", type(exc).__name__)
         return ""
     languages = [lang for lang in OCR_LANGS if lang in available]
+    _OCR_LANGUAGE_CACHE[cache_key] = languages
+    _ocr_log("language_initialization", time.perf_counter() - started,
+             languages="+".join(languages) if languages else "none")
     if not languages:
         return ""
     data_config = _tessdata_config()
@@ -472,71 +557,76 @@ def ocr_language_config(pytesseract) -> str:
 
 
 def extract_image_ocr(path: Path) -> tuple[str, str]:
+    total_started = time.perf_counter()
     pytesseract = configure_tesseract()
     if not pytesseract:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started, result="unavailable")
         logger.warning("OCR unavailable: tesseract not configured")
         return "", "ocr_unavailable"
     base_config = ocr_language_config(pytesseract)
     if not base_config:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 result="missing_language_data")
         logger.warning("OCR unavailable: no language models configured")
         return "", "ocr_unavailable"
     try:
+        loading_started = time.perf_counter()
         with Image.open(path) as image:
             image = image.convert("RGB")
             image = _bound_dimensions(image)
-            variants = _pil_variants(image)
+        _ocr_log("image_loading", time.perf_counter() - loading_started, size=f"{image.width}x{image.height}")
+        preprocessing_started = time.perf_counter()
+        variants = _pil_variants(image, include_fallbacks=False)
+        _ocr_log("image_preprocessing", time.perf_counter() - preprocessing_started,
+                 variant=variants[0][0], size=f"{variants[0][1].width}x{variants[0][1].height}")
+        with _OCR_SEMAPHORE:
             best_text = ""
             best_confidence = -1.0
+            _name, variant = variants[0]
+            psm_started = time.perf_counter()
+            try:
+                text, confidence = _run_ocr(
+                    pytesseract, variant, _psm_config(base_config, 6)
+                )
+                logger.info("OCR upload_id=%s stage=psm_execution mode=6 confidence=%.1f chars=%d",
+                            _OCR_UPLOAD_ID.get(), confidence, len(text))
+                best_text, best_confidence = text, confidence
+            except Exception as exc:
+                _ocr_log("psm_execution", level=logging.WARNING, mode=6,
+                         result=type(exc).__name__)
+                raise
+            finally:
+                _ocr_log("psm_execution", time.perf_counter() - psm_started, mode=6)
 
-            # Primary pass: PSM 6 on the cheapest, most informative variants only.
-            # This bounds Tesseract subprocesses per upload while still covering
-            # low-resolution and low-contrast failure modes.
-            for _name, variant in variants[:2]:
+            # Sparse layout recognition is justified only when measured confidence is weak.
+            if best_confidence < CONFIDENCE_FLOOR:
+                fallback_started = time.perf_counter()
                 try:
-                    text, confidence = _run_ocr(
-                        pytesseract, variant, _psm_config(base_config, 6)
-                    )
-                    logger.info(
-                        "OCR image variant=%s psm=6 confidence=%.1f chars=%d",
-                        _name, confidence, len(text),
-                    )
+                    text, confidence = _run_ocr(pytesseract, variant,
+                                                _psm_config(base_config, 11))
+                    logger.info("OCR upload_id=%s stage=psm_execution mode=11 confidence=%.1f chars=%d",
+                                _OCR_UPLOAD_ID.get(), confidence, len(text))
                     if confidence > best_confidence or (
                         confidence == best_confidence and len(text) > len(best_text)
                     ):
                         best_text = text
                         best_confidence = confidence
                 except Exception as exc:
-                    logger.warning(
-                        "OCR image variant=%s psm=6 failed (%s).", _name, type(exc).__name__
-                    )
-                    continue
+                    _ocr_log("psm_execution", level=logging.WARNING, mode=11,
+                             result=type(exc).__name__)
+                finally:
+                    _ocr_log("psm_execution", time.perf_counter() - fallback_started, mode=11)
 
-            # Fallback: sparse-text modes only when confidence is weak.
-            if best_confidence < CONFIDENCE_FLOOR and variants:
-                _, fallback_variant = variants[0]
-                for psm in (11, 12):
-                    try:
-                        text, confidence = _run_ocr(
-                            pytesseract, fallback_variant, _psm_config(base_config, psm)
-                        )
-                        logger.info(
-                            "OCR image variant=fallback psm=%d confidence=%.1f chars=%d",
-                            psm, confidence, len(text),
-                        )
-                        if confidence > best_confidence or (
-                            confidence == best_confidence and len(text) > len(best_text)
-                        ):
-                            best_text = text
-                            best_confidence = confidence
-                    except Exception as exc:
-                        logger.warning(
-                            "OCR image variant=fallback psm=%d failed (%s).",
-                            psm, type(exc).__name__,
-                        )
-                        continue
-
-            return _normalize_ocr_text(best_text), "ocr"
+            normalization_started = time.perf_counter()
+            normalized = _normalize_ocr_text(best_text)
+            _ocr_log("text_normalization", time.perf_counter() - normalization_started,
+                     chars=len(normalized))
+            _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                     confidence=f"{best_confidence:.1f}", chars=len(normalized))
+            return normalized, "ocr"
     except Exception as exc:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 level=logging.ERROR, result=type(exc).__name__)
         logger.warning("Image OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
 
@@ -675,6 +765,7 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
         if not validate_signature(target, suffix):
             raise HTTPException(415, "The file content does not match its extension.")
         logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
+        upload_context = _OCR_UPLOAD_ID.set(doc_id)
         try:
             text, extraction = await asyncio.wait_for(
                 run_in_threadpool(extract_text, target, suffix), timeout=UPLOAD_OCR_TIMEOUT
@@ -683,6 +774,8 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
             target.unlink(missing_ok=True)
             logger.error("Upload %s: OCR/text extraction timed out after %ss", doc_id, UPLOAD_OCR_TIMEOUT)
             raise HTTPException(504, "Document processing timed out. Please try a smaller or simpler file.")
+        finally:
+            _OCR_UPLOAD_ID.reset(upload_context)
         text = text[:500_000]
         logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
