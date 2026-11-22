@@ -394,6 +394,29 @@ def test_extract_image_ocr_falls_back_to_sparse_psm_when_confidence_low(tmp_path
     assert text == "MAN SEEKS PEACE"
 
 
+def test_subprocess_timeout_during_psm_fallback_stops_all_later_passes(tmp_path, monkeypatch):
+    image_path = tmp_path / "timeout-fallback.png"
+    _make_image(size=(300, 120)).save(image_path)
+    mock = _mock_pytesseract({6: ("", 0)})
+    monkeypatch.setattr(api, "configure_tesseract", lambda: mock)
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    calls = []
+
+    def run_ocr(_pytesseract, _image, config, **kwargs):
+        calls.append((config, kwargs.get("purpose")))
+        if "--psm 6" in config:
+            return "mixed placeholder", 20
+        raise api.OCRProcessingTimeout("fallback child process timed out")
+
+    monkeypatch.setattr(api, "_run_ocr", run_ocr)
+    with pytest.raises(api.OCRProcessingTimeout):
+        api.extract_image_ocr(image_path)
+    assert calls == [
+        ("-l eng+hin+guj --psm 6", "primary_psm6"),
+        ("-l eng+hin+guj --psm 11", "low_confidence_psm11"),
+    ]
+
+
 def test_extract_image_ocr_rechecks_strong_indic_script_mixture(tmp_path, monkeypatch):
     image_path = tmp_path / "indic.png"
     _make_image(size=(300, 120)).save(image_path)

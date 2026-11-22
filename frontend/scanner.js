@@ -3,15 +3,15 @@
   else root.JanSathiScanner = factory();
 })(globalThis, function () {
   const DETECTOR_DEFAULTS = Object.freeze({
-    width: 96, height: 128, minArea: 0.14, maxArea: 0.86,
-    minBrightness: 95, maxBrightness: 242, minSharpness: 45,
-    stableFrames: 6, stableDurationMs: 700, maxCenterDrift: 0.035,
+    width: 112, height: 144, minArea: 0.12, maxArea: 0.92,
+    minBrightness: 68, minPageBrightness: 105, maxPageBrightness: 250, minSharpness: 36,
+    stableFrames: 6, stableDurationMs: 850, maxCenterDrift: 0.03,
     maxSizeDrift: 0.045, sampleIntervalMs: 160,
   });
 
-  // Finds a bright, low-saturation connected region that resembles a page.
-  // Small sampling keeps this inexpensive on mobile; frames touching the
-  // border, extreme shapes, poor lighting, and low edge sharpness are rejected.
+  // Adaptive luminance regions tolerate colored paper, printed texture, a
+  // center gutter and mildly curved book pages. Region texture and Laplacian
+  // sharpness distinguish printed pages from an empty, uniformly bright view.
   function analyzeDocumentFrame(video, canvas, settings = {}) {
     const cfg = { ...DETECTOR_DEFAULTS, ...settings };
     if (!video?.videoWidth || !video?.videoHeight || !canvas) return { status: 'Position your document inside the frame' };
@@ -23,7 +23,7 @@
     catch { return { status: 'Position your document inside the frame' }; }
     const { data } = context.getImageData(0, 0, cfg.width, cfg.height);
     const total = cfg.width * cfg.height;
-    const mask = new Uint8Array(total);
+    const histogram = new Uint32Array(256);
     const gray = new Uint8Array(total);
     let frameLight = 0;
     for (let i = 0; i < total; i++) {
@@ -32,13 +32,29 @@
       const y = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
       gray[i] = y;
       frameLight += y;
-      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
-      if (y >= 150 && saturation <= 90) mask[i] = 1;
+      histogram[y]++;
     }
     if (frameLight / total < cfg.minBrightness) return { status: 'Improve lighting' };
 
+    let sumAll = 0, sumBackground = 0, weightBackground = 0, bestVariance = -1, otsu = 128;
+    for (let i = 0; i < 256; i++) sumAll += i * histogram[i];
+    for (let i = 0; i < 256; i++) {
+      weightBackground += histogram[i];
+      if (!weightBackground) continue;
+      const weightForeground = total - weightBackground;
+      if (!weightForeground) break;
+      sumBackground += i * histogram[i];
+      const meanBackground = sumBackground / weightBackground;
+      const meanForeground = (sumAll - sumBackground) / weightForeground;
+      const variance = weightBackground * weightForeground * (meanBackground - meanForeground) ** 2;
+      if (variance > bestVariance) { bestVariance = variance; otsu = i; }
+    }
+    const threshold = Math.max(105, Math.min(220, otsu + 12));
+    const mask = new Uint8Array(total);
+    for (let i = 0; i < total; i++) if (gray[i] >= threshold) mask[i] = 1;
+
     const seen = new Uint8Array(total);
-    let best = null;
+    const regions = [];
     const stack = new Int32Array(total);
     for (let seed = 0; seed < total; seed++) {
       if (!mask[seed] || seen[seed]) continue;
@@ -50,35 +66,70 @@
         count++;
         if (x < minX) minX = x; if (x > maxX) maxX = x;
         if (y < minY) minY = y; if (y > maxY) maxY = y;
-        const neighbors = [x ? index - 1 : -1, x + 1 < cfg.width ? index + 1 : -1,
-          y ? index - cfg.width : -1, y + 1 < cfg.height ? index + cfg.width : -1];
-        for (const next of neighbors) if (next >= 0 && mask[next] && !seen[next]) {
-          seen[next] = 1; stack[top++] = next;
-        }
+        const left = x ? index - 1 : -1, right = x + 1 < cfg.width ? index + 1 : -1;
+        const up = y ? index - cfg.width : -1, down = y + 1 < cfg.height ? index + cfg.width : -1;
+        if (left >= 0 && mask[left] && !seen[left]) { seen[left] = 1; stack[top++] = left; }
+        if (right >= 0 && mask[right] && !seen[right]) { seen[right] = 1; stack[top++] = right; }
+        if (up >= 0 && mask[up] && !seen[up]) { seen[up] = 1; stack[top++] = up; }
+        if (down >= 0 && mask[down] && !seen[down]) { seen[down] = 1; stack[top++] = down; }
       }
-      if (count > (best?.count || 0)) best = { minX, minY, maxX, maxY, count };
+      if (count / total >= 0.035) regions.push({ minX, minY, maxX, maxY, count });
     }
-    if (!best || best.count / total < cfg.minArea) return { status: 'Move closer' };
-    const { minX, minY, maxX, maxY } = best;
-    const width = maxX - minX + 1, height = maxY - minY + 1;
-    const area = best.count / total, aspect = width / height;
-    const box = { x: minX / cfg.width, y: minY / cfg.height,
-      width: width / cfg.width, height: height / cfg.height };
-    if (area > cfg.maxArea || minX < 3 || minY < 3 || maxX >= cfg.width - 3 || maxY >= cfg.height - 3 ||
-        aspect < 0.35 || aspect > 1.8 || box.x < 0.12 || box.x + box.width > 0.88 ||
-        box.y < 0.08 || box.y + box.height > 0.92) {
+    if (!regions.length) return { status: 'Looking for document...' };
+
+    // Consider both each page and the union of adjacent page regions. The
+    // union handles an open spread split by a dark gutter without requiring a
+    // perfect four-corner contour.
+    const candidates = [...regions];
+    for (let a = 0; a < regions.length; a++) for (let b = a + 1; b < regions.length; b++) {
+      const first = regions[a], second = regions[b];
+      const gapX = Math.max(0, Math.max(first.minX, second.minX) - Math.min(first.maxX, second.maxX) - 1);
+      const overlapY = Math.max(0, Math.min(first.maxY, second.maxY) - Math.max(first.minY, second.minY) + 1);
+      const sharedHeight = overlapY / Math.max(1, Math.min(first.maxY - first.minY + 1, second.maxY - second.minY + 1));
+      if (gapX <= cfg.width * 0.1 && sharedHeight >= 0.55) candidates.push({
+        minX: Math.min(first.minX, second.minX), minY: Math.min(first.minY, second.minY),
+        maxX: Math.max(first.maxX, second.maxX), maxY: Math.max(first.maxY, second.maxY),
+        count: first.count + second.count,
+      });
+    }
+    candidates.sort((a, b) => b.count - a.count);
+    let best = null;
+    for (const region of candidates) {
+      const width = region.maxX - region.minX + 1, height = region.maxY - region.minY + 1;
+      const aspect = width / height, boxArea = width * height / total;
+      if (boxArea < cfg.minArea || boxArea > cfg.maxArea || aspect < 0.32 || aspect > 2.65) continue;
+      const box = { x: region.minX / cfg.width, y: region.minY / cfg.height,
+        width: width / cfg.width, height: height / cfg.height };
+      if (region.minX < 2 || region.minY < 2 || region.maxX >= cfg.width - 2 || region.maxY >= cfg.height - 2 ||
+          box.x < 0.06 || box.x + box.width > 0.94 || box.y < 0.05 || box.y + box.height > 0.95) continue;
+      if (!best || boxArea > best.area) best = { ...region, box, area: boxArea };
+    }
+    if (!best) return regions.some(region => region.count / total < cfg.minArea)
+      ? { status: 'Move closer' } : { status: 'Position your document inside the frame' };
+
+    const { minX, minY, maxX, maxY, box } = best;
+    const centerX = box.x + box.width / 2, centerY = box.y + box.height / 2;
+    if (centerX < 0.29 || centerX > 0.71 || centerY < 0.17 || centerY > 0.83) {
       return { status: 'Position your document inside the frame', box };
     }
-    if (frameLight / total > cfg.maxBrightness) return { status: 'Improve lighting', box };
-    const values = [];
+    let pageLuminance = 0, edges = 0, lapMean = 0, lapSquared = 0, sampleCount = 0;
     for (let y = minY + 1; y < maxY; y++) for (let x = minX + 1; x < maxX; x++) {
       const i = y * cfg.width + x;
-      values.push(4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - cfg.width] - gray[i + cfg.width]);
+      const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - cfg.width] - gray[i + cfg.width];
+      pageLuminance += gray[i];
+      if (Math.abs(lap) > 28) edges++;
+      lapMean += lap; lapSquared += lap * lap; sampleCount++;
     }
-    const mean = values.reduce((a, b) => a + b, 0) / Math.max(values.length, 1);
-    const sharpness = values.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(values.length, 1);
-    if (sharpness < cfg.minSharpness) return { status: 'Hold steady', box, sharpness };
-    return { status: 'Document detected', box, sharpness };
+    const mean = lapMean / Math.max(sampleCount, 1);
+    const sharpness = lapSquared / Math.max(sampleCount, 1) - mean * mean;
+    const normalizedPageLight = pageLuminance / Math.max(sampleCount, 1);
+    const edgeDensity = edges / Math.max(sampleCount, 1);
+    if (normalizedPageLight < cfg.minPageBrightness || normalizedPageLight > cfg.maxPageBrightness) {
+      return { status: 'Improve lighting', box };
+    }
+    if (edgeDensity < 0.004) return { status: 'Looking for document...', box };
+    if (sharpness < cfg.minSharpness) return { status: 'Image is blurry', box, sharpness };
+    return { status: 'Document detected', box, sharpness, edgeDensity };
   }
 
   function boxesStable(previous, current, cfg = DETECTOR_DEFAULTS) {
@@ -96,6 +147,8 @@
     const makeFile = options.makeFile ?? ((blob, name) => new File([blob], name, { type: blob.type || 'image/jpeg', lastModified: Date.now() }));
     const onState = options.onState ?? (() => {});
     const onConfirm = options.onConfirm ?? (() => {});
+    const onAutoUpload = options.onAutoUpload ?? null;
+    const onAutoUploadComplete = options.onAutoUploadComplete ?? (() => {});
     const detectFrame = options.detectFrame ?? analyzeDocumentFrame;
     const requestFrame = options.requestAnimationFrame ?? globalThis.requestAnimationFrame?.bind(globalThis);
     const cancelFrame = options.cancelAnimationFrame ?? globalThis.cancelAnimationFrame?.bind(globalThis);
@@ -113,10 +166,54 @@
     let previousBox = null;
     let capturePending = false;
     let captureInProgress = null;
+    let uploadController = null;
+    let uploadInProgress = false;
+    let uploadFailed = false;
+    let autoCaptured = false;
+    let uploadProgress = 0;
 
     function publish(phase, error = '', status = '') {
-      onState({ phase, error, status, autoCapture, file: capturedFile, previewUrl });
+      onState({ phase, error, status, autoCapture, file: capturedFile, previewUrl,
+        autoCaptured, uploadProgress });
     }
+
+    async function uploadCapturedFile() {
+      if (!capturedFile || !autoCaptured || !onAutoUpload || uploadInProgress) return false;
+      uploadInProgress = true;
+      uploadFailed = false;
+      uploadProgress = 0;
+      const requestId = generation;
+      const controller = new AbortController();
+      uploadController = controller;
+      publish('uploading', '', 'Uploading document...');
+      try {
+        const document = await onAutoUpload(capturedFile, {
+          signal: controller.signal,
+          onProgress(percent) {
+            if (requestId !== generation || controller.signal.aborted) return;
+            uploadProgress = Math.max(0, Math.min(100, Math.round(percent)));
+            publish('uploading', '', uploadProgress < 100 ? `Uploading document... ${uploadProgress}%` : 'Processing document...');
+          },
+        });
+        if (requestId !== generation || controller.signal.aborted) return false;
+        uploadInProgress = false;
+        uploadFailed = false;
+        uploadController = null;
+        publish('uploaded', '', 'Document ready');
+        try { onAutoUploadComplete(document, capturedFile); }
+        catch (error) { publish('uploaded', `Document saved, but the overview could not open: ${error?.message || 'please open History'}`); }
+        return true;
+      } catch (error) {
+        if (requestId !== generation || controller.signal.aborted) return false;
+        uploadInProgress = false;
+        uploadFailed = true;
+        uploadController = null;
+        publish('upload-error', error?.message || 'Upload failed. Retry or retake the image.');
+        return false;
+      }
+    }
+
+    function retryUpload() { return uploadFailed ? uploadCapturedFile() : false; }
 
     function stopDetection() {
       if (frameHandle !== null && cancelFrame) cancelFrame(frameHandle);
@@ -172,6 +269,8 @@
       if (previewUrl) URLApi.revokeObjectURL(previewUrl);
       previewUrl = null;
       capturedFile = null;
+      autoCaptured = false;
+      uploadFailed = false;
     }
 
     function stopTracks() {
@@ -279,13 +378,21 @@
         publish('error', 'The camera did not return an image. Please try again.');
         return false;
       }
+      if (blob.size < 1200 || Math.max(canvas.width, canvas.height) < 600 || Math.min(canvas.width, canvas.height) < 300) {
+        if (captureInProgress === requestId) captureInProgress = null;
+        stopTracks();
+        publish('error', 'The captured image is too small to read. Move closer and try again.');
+        return false;
+      }
       releasePreview();
       capturedFile = makeFile(blob, `JanSathi-scan-${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`);
       previewUrl = URLApi.createObjectURL(capturedFile);
       stopTracks();
       capturePending = false;
       if (captureInProgress === requestId) captureInProgress = null;
+      autoCaptured = autoCapture && Boolean(onAutoUpload);
       publish('preview');
+      if (autoCaptured) void uploadCapturedFile();
       return true;
     }
 
@@ -298,6 +405,7 @@
       releasePreview();
       capturedFile = file;
       previewUrl = URLApi.createObjectURL(file);
+      autoCaptured = false;
       publish('preview');
       return true;
     }
@@ -312,6 +420,8 @@
 
     function close() {
       generation += 1;
+      if (uploadController) uploadController.abort();
+      uploadController = null; uploadInProgress = false; uploadFailed = false; uploadProgress = 0; autoCaptured = false;
       stopDetection(); capturePending = false; captureInProgress = null;
       stopTracks();
       releasePreview();
@@ -320,12 +430,15 @@
 
     function dispose() {
       generation += 1;
+      if (uploadController) uploadController.abort();
+      uploadController = null; uploadInProgress = false; uploadFailed = false; uploadProgress = 0; autoCaptured = false;
       stopDetection(); capturePending = false; captureInProgress = null;
       stopTracks();
       releasePreview();
     }
 
-    return { start, capture, usePhoto, confirm, close, dispose, setAutoCapture, analyzeDocumentFrame };
+    return { start, capture, usePhoto, confirm, close, dispose, setAutoCapture,
+      retryUpload, analyzeDocumentFrame };
   }
 
   return { createScannerController, analyzeDocumentFrame, DETECTOR_DEFAULTS };

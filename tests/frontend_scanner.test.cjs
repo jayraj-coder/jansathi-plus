@@ -11,7 +11,7 @@ function setup({ getUserMedia, play = async () => {}, urlApi } = {}) {
   const canvas = {
     width: 0, height: 0,
     getContext: () => ({ drawImage: (...args) => events.push(['draw', ...args.slice(1)]) }),
-    toBlob: callback => callback(new Blob(['scan'], { type: 'image/jpeg' })),
+    toBlob: callback => callback(new Blob([new Uint8Array(2200)], { type: 'image/jpeg' })),
   };
   let nextUrl = 0;
   const urls = urlApi || {
@@ -96,7 +96,7 @@ test('capture preparation errors stop camera tracks before offering the fallback
 });
 
 function syntheticFrame({ page = true, light = 80 } = {}) {
-  const width = 96, height = 128;
+  const width = 112, height = 144;
   const pixels = new Uint8ClampedArray(width * height * 4);
   for (let i = 0; i < width * height; i++) pixels.set([light, light, light, 255], i * 4);
   if (page) {
@@ -113,12 +113,30 @@ test('document detector distinguishes missing page, poor light, and a well-frame
     drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 110 }).pixels }; },
   }) };
   const video = { videoWidth: 640, videoHeight: 480 };
-  assert.equal(analyzeDocumentFrame(video, canvas, { minBrightness: 95 }).status, 'Move closer');
+  assert.equal(analyzeDocumentFrame(video, canvas, { minBrightness: 95 }).status, 'Looking for document...');
   const darkCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 30 }).pixels }; } }) };
   assert.equal(analyzeDocumentFrame(video, darkCanvas).status, 'Improve lighting');
   const pageCanvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: syntheticFrame({ light: 40 }).pixels }; } }) };
   assert.equal(analyzeDocumentFrame(video, pageCanvas).status, 'Document detected');
-  assert.equal(analyzeDocumentFrame(video, pageCanvas, { minSharpness: 1e9 }).status, 'Hold steady');
+  assert.equal(analyzeDocumentFrame(video, pageCanvas, { minSharpness: 1e9 }).status, 'Image is blurry');
+  assert.equal(analyzeDocumentFrame(video, pageCanvas, { minArea: .55 }).status, 'Move closer');
+});
+
+test('detector finds an open textbook spread across a dark central gutter', () => {
+  const width = 112, height = 144, pixels = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < width * height; i++) pixels.set([95, 95, 95, 255], i * 4);
+  for (const [left, right] of [[12, 52], [60, 100]]) {
+    for (let y = 14; y < 132; y++) for (let x = left; x < right; x++) {
+      const glyph = (y % 11 === 0 && x > left + 5 && x < right - 4) ||
+        (x % 13 === 0 && y % 11 > 3 && y % 11 < 8);
+      const shade = glyph ? 45 : 226;
+      pixels.set([shade, shade - 4, shade - 10, 255], (y * width + x) * 4);
+    }
+  }
+  const canvas = { getContext: () => ({ drawImage() {}, getImageData() { return { data: pixels }; } }) };
+  const result = analyzeDocumentFrame({ videoWidth: 1280, videoHeight: 720 }, canvas);
+  assert.equal(result.status, 'Document detected');
+  assert.ok(result.box.width > .7, 'the two page regions merge into a spread-sized region');
 });
 
 test('Auto Capture requires stable detections for the configured frame count and duration', async () => {
@@ -164,4 +182,122 @@ test('disabling Auto Capture cancels pending analysis immediately and keeps manu
   assert.equal(callbacks.size, 0);
   assert.equal(await controller.capture(), true);
   assert.equal(detections, 0);
+});
+
+test('Auto Capture uploads exactly once after capture and reports upload progress', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, uploads = 0, completions = 0, lastFile;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:auto-upload', revokeObjectURL() {} },
+    makeFile: (blob, name) => { lastFile = Object.assign(blob, { name }); return lastFile; },
+    detectFrame: () => ({ status: 'Document detected', box: { x: .18, y: .1, width: .64, height: .8 } }),
+    onState: state => f.states.push(state),
+    onAutoUpload: async (file, { onProgress }) => {
+      uploads++; assert.equal(file, lastFile); onProgress(42); onProgress(100);
+      return { id: 'doc-1', status: 'completed' };
+    },
+    onAutoUploadComplete: () => { completions++; },
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { stableFrames: 6, stableDurationMs: 700, sampleIntervalMs: 100 },
+  });
+  await controller.start();
+  for (const time of [100, 250, 400, 550, 700, 850]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(uploads, 1);
+  assert.equal(completions, 1);
+  assert.equal(f.states.at(-1).phase, 'uploaded');
+  assert.equal(await controller.retryUpload(), false, 'a completed upload cannot be repeated');
+  assert.equal(uploads, 1);
+});
+
+test('failed automatic upload retains its capture and retry uses the same file once', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, uploads = 0, uploadedFile;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:retry', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: { x: .18, y: .1, width: .64, height: .8 } }),
+    onState: state => f.states.push(state),
+    onAutoUpload: async file => {
+      uploads++; uploadedFile ||= file; assert.equal(file, uploadedFile);
+      if (uploads === 1) throw new Error('Server is busy. Retry the captured photo.');
+      return { id: 'doc-2', status: 'completed' };
+    },
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { stableFrames: 6, stableDurationMs: 700, sampleIntervalMs: 100 },
+  });
+  await controller.start();
+  for (const time of [100, 250, 400, 550, 700, 850]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.states.at(-1).phase, 'upload-error');
+  assert.equal(f.states.at(-1).file, uploadedFile);
+  assert.equal(await controller.retryUpload(), true);
+  assert.equal(uploads, 2);
+  assert.equal(f.states.at(-1).phase, 'uploaded');
+});
+
+test('camera movement resets stability and prevents an automatic capture', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, samples = 0;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:moving', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: {
+      x: samples++ % 2 ? .2 : .42, y: .12, width: .6, height: .76,
+    } }),
+    onState: state => f.states.push(state),
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { stableFrames: 6, stableDurationMs: 700, sampleIntervalMs: 100 },
+  });
+  await controller.start();
+  for (const time of [100, 250, 400, 550, 700, 850, 1000, 1150]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  assert.equal(samples, 8);
+  assert.equal(f.tracks[0].stopped, false);
+  assert.equal(f.states.at(-1).phase, 'live');
+  controller.close();
+});
+
+test('closing during automatic upload aborts the request and releases camera resources', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, requestSignal;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:cancel', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: { x: .18, y: .1, width: .64, height: .8 } }),
+    onState: state => f.states.push(state),
+    onAutoUpload: (_file, { signal }) => {
+      requestSignal = signal;
+      return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(Error('cancelled')), { once: true }));
+    },
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { stableFrames: 6, stableDurationMs: 700, sampleIntervalMs: 100 },
+  });
+  await controller.start();
+  for (const time of [100, 250, 400, 550, 700, 850]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.states.at(-1).phase, 'uploading');
+  controller.close();
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(f.tracks[0].stopped, true);
+  assert.equal(f.states.at(-1).phase, 'closed');
 });
