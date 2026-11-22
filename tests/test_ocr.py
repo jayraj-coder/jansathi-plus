@@ -214,3 +214,198 @@ def test_health_response_shape_is_unchanged(monkeypatch):
     }
     assert response.json()["ocr_configured"] is True
     assert response.json()["ocr_languages"] == ["eng"]
+
+from types import SimpleNamespace
+from PIL import Image
+
+from backend import main as api
+
+
+def _make_image(mode="RGB", size=(100, 50), color=(255, 255, 255)):
+    return Image.new(mode, size, color)
+
+
+def _mock_pytesseract(psm_text_conf):
+    """psm_text_conf: {psm: (text, confidence)}"""
+    m = SimpleNamespace()
+
+    def image_to_string(image, config=""):
+        for psm, (text, _conf) in psm_text_conf.items():
+            if f"--psm {psm}" in config:
+                return text
+        return ""
+
+    def image_to_data(image, config="", output_type=None):
+        for psm, (_text, conf) in psm_text_conf.items():
+            if f"--psm {psm}" in config:
+                class Data:
+                    conf = [conf, conf, conf]
+                return Data()
+        class Data:
+            conf = []
+        return Data()
+
+    m.image_to_string = image_to_string
+    m.image_to_data = image_to_data
+    m.get_languages = lambda config="": ["eng", "hin", "guj", "osd"]
+    return m
+
+
+# ---------------- CER / WER measurement ----------------
+
+def test_cer_identical_text_is_zero():
+    assert api.cer("MAN SEEKS PEACE", "MAN SEEKS PEACE") == 0.0
+
+
+def test_cer_empty_reference_with_hypothesis_is_one():
+    assert api.cer("", "ABC") == 1.0
+
+
+def test_cer_substitution_cost():
+    assert abs(api.cer("CAT", "BAT") - (1.0 / 3.0)) < 1e-9
+
+
+def test_wer_identical_text_is_zero():
+    assert api.wer("THE CAT SAT", "THE CAT SAT") == 0.0
+
+
+def test_wer_word_substitution():
+    assert abs(api.wer("THE CAT", "THE BAT") - 0.5) < 1e-9
+
+
+def test_wer_empty_reference():
+    assert api.wer("", "WORD") == 1.0
+
+
+def test_cer_wer_bug_example_is_measurable():
+    # Ground truth from the real decorative-text test image.
+    reference = "MAN SEEKS PEACE, YET AT THE SAME TIME YEARNING FOR WAR"
+    hypothesis = "MAN SEEKS P IMB INKING OF P HILST 05085"
+    c = api.cer(reference, hypothesis)
+    w = api.wer(reference, hypothesis)
+    assert 0.0 < c <= 1.0
+    assert 0.0 < w <= 1.0
+    # The garbled hypothesis should register as clearly inaccurate.
+    assert c > 0.5
+    assert w > 0.5
+
+
+# ---------------- preprocessing variants ----------------
+
+def test_pil_variants_include_all_strategies_and_preserve_original():
+    img = _make_image()
+    variants = api._pil_variants(img)
+    names = [name for name, _ in variants]
+    assert "original" in names
+    assert "enhanced_grayscale" in names
+    assert "otsu" in names
+    assert "adaptive" in names
+    by_name = dict(variants)
+    original = by_name["original"]
+    assert original.mode == img.mode
+    assert original.size == img.size
+
+
+def test_low_resolution_image_is_upscaled_in_enhanced_variant():
+    img = _make_image(size=(100, 50))
+    variants = dict(api._pil_variants(img))
+    enhanced = variants["enhanced_grayscale"]
+    assert enhanced.size == (200, 100)
+    assert enhanced.mode == "L"
+
+
+def test_otsu_threshold_produces_binary_image():
+    img = Image.new("L", (10, 10), 240)
+    img.putpixel((5, 5), 30)
+    out = api._otsu_threshold(img)
+    assert out.mode == "L"
+    assert out.size == (10, 10)
+    values = {out.getpixel((x, y)) for y in range(out.height) for x in range(out.width)}
+    assert values <= {0, 255}
+
+
+def test_adaptive_threshold_produces_binary_image():
+    img = Image.new("L", (20, 20), 240)
+    out = api._adaptive_threshold(img)
+    assert out.mode == "L"
+    assert out.size == (20, 20)
+    values = {out.getpixel((x, y)) for y in range(out.height) for x in range(out.width)}
+    assert values <= {0, 255}
+
+
+def test_normalize_collapses_whitespace_and_preserves_punctuation():
+    assert api._normalize_ocr_text("MAN   SEEKS\tPEACE.") == "MAN SEEKS PEACE."
+    assert api._normalize_ocr_text("WHILST?") == "WHILST?"
+    assert api._normalize_ocr_text("a\n\n\nb") == "a\n\nb"
+    assert api._normalize_ocr_text("") == ""
+    assert api._normalize_ocr_text("   ") == ""
+
+
+# ---------------- OCR selection / fallback ----------------
+
+def _install_mock_pytesseract(monkeypatch, psm_text_conf):
+    m = _mock_pytesseract(psm_text_conf)
+    monkeypatch.setattr(api, "configure_tesseract", lambda: m)
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+
+
+def test_extract_image_ocr_selects_high_confidence_psm6(tmp_path, monkeypatch):
+    img = _make_image(size=(200, 100))
+    img.save(tmp_path / "doc.png")
+    _install_mock_pytesseract(monkeypatch, {6: ("MAN SEEKS PEACE", 95)})
+    text, label = api.extract_image_ocr(tmp_path / "doc.png")
+    assert label == "ocr"
+    assert text == "MAN SEEKS PEACE"
+
+
+def test_extract_image_ocr_falls_back_to_sparse_psm_when_confidence_low(tmp_path, monkeypatch):
+    img = _make_image(size=(200, 100))
+    img.save(tmp_path / "doc.png")
+    _install_mock_pytesseract(
+        monkeypatch, {6: ("MAN SEEKS P", 20), 11: ("MAN SEEKS PEACE", 90)}
+    )
+    text, label = api.extract_image_ocr(tmp_path / "doc.png")
+    assert label == "ocr"
+    assert text == "MAN SEEKS PEACE"
+
+
+def test_ocr_language_config_reports_english_hindi_gujarati(monkeypatch):
+    m = _mock_pytesseract({6: ("text", 95)})
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    config = api.ocr_language_config(m)
+    assert config == "-l eng+hin+guj"
+
+
+def test_extract_image_ocr_missing_tesseract_returns_unavailable(tmp_path, monkeypatch):
+    img = _make_image(size=(200, 100))
+    img.save(tmp_path / "doc.png")
+    monkeypatch.setattr(api, "configure_tesseract", lambda: None)
+    text, label = api.extract_image_ocr(tmp_path / "doc.png")
+    assert text == ""
+    assert label == "ocr_unavailable"
+
+
+def test_extract_scanned_pdf_missing_tesseract_returns_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "configure_tesseract", lambda: None)
+    text, label = api.extract_scanned_pdf(tmp_path / "scan.pdf")
+    assert text == ""
+    assert label == "ocr_unavailable"
+
+
+# ---------------- language preservation ----------------
+
+def test_get_ocr_languages_reports_english_hindi_gujarati(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "configure_tesseract",
+        lambda: SimpleNamespace(
+            get_languages=lambda config="": ["eng", "hin", "guj", "osd"]
+        ),
+    )
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    assert api.get_ocr_languages() == ["eng", "hin", "guj"]
+
+
+def test_get_ocr_languages_empty_when_tesseract_missing(monkeypatch):
+    monkeypatch.setattr(api, "configure_tesseract", lambda: None)
+    assert api.get_ocr_languages() == []

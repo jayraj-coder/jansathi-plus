@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
+
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
@@ -276,6 +279,170 @@ def configure_tesseract():
     )
     return pytesseract
 
+# OCR accuracy tuning knobs. Document upload is not on the hot request path, so
+# spending a few extra tesseract passes to pick the best result is acceptable.
+UPSCALE_SMALL_IMAGE = True
+UPSCALE_SCALE = 2
+MIN_LONG_SIDE_FOR_UPSCALE = 1200
+CONFIDENCE_FLOOR = 45.0
+PSM_MODES = (6, 11, 12)  # 6: uniform block, 11: sparse text, 12: sparse text + OSD
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Levenshtein edit distance (unit cost) for CER/WER measurement."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            current[j] = min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + cost,
+            )
+        previous = current
+    return previous[-1]
+
+
+def cer(reference: str, hypothesis: str) -> float:
+    """Character Error Rate = edit distance / reference character count."""
+    reference = reference or ""
+    hypothesis = hypothesis or ""
+    if not reference:
+        return 0.0 if not hypothesis else 1.0
+    return _levenshtein_distance(reference, hypothesis) / len(reference)
+
+
+def wer(reference: str, hypothesis: str) -> float:
+    """Word Error Rate = edit distance on word tokens / reference word count."""
+    ref_words = (reference or "").split()
+    hyp_words = (hypothesis or "").split()
+    if not ref_words:
+        return 0.0 if not hyp_words else 1.0
+    return _levenshtein_distance(ref_words, hyp_words) / len(ref_words)
+
+
+def _mean_confidence(data: dict) -> float:
+    confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c >= 0]
+    if not confs:
+        return 0.0
+    return sum(confs) / len(confs)
+
+
+def _otsu_threshold(image: Image.Image) -> Image.Image:
+    """Binarize using Otsu's method; separates text from complex backgrounds."""
+    arr = np.array(image.convert("L"), dtype=np.uint8)
+    hist, _ = np.histogram(arr, bins=256, range=(0, 256))
+    total = int(arr.size)
+    sum_total = int(np.dot(np.arange(256, dtype=np.int64), hist))
+    sum_b = 0
+    w_b = 0
+    best_t = 0
+    max_var = -1.0
+    for t in range(256):
+        w_b += int(hist[t])
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * int(hist[t])
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        var_between = float(w_b) * float(w_f) * float((m_b - m_f) ** 2)
+        if var_between > max_var:
+            max_var = var_between
+            best_t = t
+    binary = ((arr > best_t).astype(np.uint8)) * 255
+    return Image.fromarray(binary, mode="L")
+
+
+def _adaptive_threshold(image: Image.Image, block_size: int = 15, offset: float = 10.0) -> Image.Image:
+    """Binarize using a local-mean approximation (BoxBlur) as adaptive threshold."""
+    gray = image.convert("L")
+    local_mean = np.array(gray.filter(ImageFilter.BoxBlur(block_size // 2)), dtype=np.float32)
+    arr = np.array(gray, dtype=np.float32)
+    binary = ((arr < (local_mean - offset)).astype(np.uint8)) * 255
+    return Image.fromarray(binary, mode="L")
+
+
+def _pil_variants(image: Image.Image):
+    """Return (name, PIL image) preprocessing variants.
+
+    The original image is preserved unchanged. Each variant targets a different
+    failure mode: low resolution, low contrast, or text over a complex background.
+    """
+    variants = [("original", image.copy())]
+
+    try:
+        grayscale = image.convert("L")
+    except Exception:
+        grayscale = image
+
+    w, h = grayscale.size
+    if UPSCALE_SMALL_IMAGE and max(w, h) < MIN_LONG_SIDE_FOR_UPSCALE:
+        base = grayscale.resize((w * UPSCALE_SCALE, h * UPSCALE_SCALE), Image.LANCZOS)
+    else:
+        base = grayscale
+
+    try:
+        contrasted = ImageEnhance.Contrast(base).enhance(2.0)
+    except Exception:
+        contrasted = base
+
+    try:
+        denoised = contrasted.filter(ImageFilter.MedianFilter(size=3))
+    except Exception:
+        denoised = contrasted
+
+    variants.append(("enhanced_grayscale", denoised))
+
+    try:
+        variants.append(("otsu", _otsu_threshold(denoised)))
+    except Exception:
+        pass
+    try:
+        variants.append(("adaptive", _adaptive_threshold(denoised)))
+    except Exception:
+        pass
+
+    return variants
+
+
+def _psm_config(base_config: str, psm: int) -> str:
+    return base_config + f" --psm {psm}"
+
+
+def _run_ocr(pytesseract, image: Image.Image, config: str):
+    """Run one OCR pass; return (text, mean_confidence)."""
+    text = pytesseract.image_to_string(image, config=config)
+    try:
+        data = pytesseract.image_to_data(
+            image, config=config, output_type=pytesseract.Output.DICT
+        )
+        confidence = _mean_confidence(data)
+    except Exception:
+        confidence = 0.0
+    return text, confidence
+
+
+def _normalize_ocr_text(text: str) -> str:
+    """Safely normalize OCR output without correcting or guessing words."""
+    if not text:
+        return ""
+    text = text.replace("\f", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t\u00a0]+", " ", line).strip() for line in text.split("\n")]
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def ocr_language_config(pytesseract) -> str:
     try:
         available = set(pytesseract.get_languages(config=_tessdata_config()))
@@ -288,31 +455,68 @@ def ocr_language_config(pytesseract) -> str:
     data_config = _tessdata_config()
     return "-l " + "+".join(languages) + (" " + data_config if data_config else "")
 
+
 def extract_image_ocr(path: Path) -> tuple[str, str]:
     pytesseract = configure_tesseract()
     if not pytesseract:
         return "", "ocr_unavailable"
-    config = ocr_language_config(pytesseract)
-    if not config:
+    base_config = ocr_language_config(pytesseract)
+    if not base_config:
         return "", "ocr_unavailable"
     try:
-        from PIL import Image
         with Image.open(path) as image:
-            return pytesseract.image_to_string(image, config=config), "ocr"
+            image = image.convert("RGB")
+            best_text = ""
+            best_confidence = -1.0
+            variants = _pil_variants(image)
+
+            # Primary pass: uniform block mode (PSM 6) across all variants.
+            for _name, variant in variants:
+                try:
+                    text, confidence = _run_ocr(
+                        pytesseract, variant, _psm_config(base_config, 6)
+                    )
+                    if confidence > best_confidence or (
+                        confidence == best_confidence and len(text) > len(best_text)
+                    ):
+                        best_text = text
+                        best_confidence = confidence
+                except Exception:
+                    continue
+
+            # If confidence is weak, evaluate sparse-text modes (PSM 11/12).
+            if best_confidence < CONFIDENCE_FLOOR and variants:
+                _, fallback_variant = variants[0]
+                for psm in PSM_MODES:
+                    if psm == 6:
+                        continue
+                    try:
+                        text, confidence = _run_ocr(
+                            pytesseract, fallback_variant, _psm_config(base_config, psm)
+                        )
+                        if confidence > best_confidence or (
+                            confidence == best_confidence and len(text) > len(best_text)
+                        ):
+                            best_text = text
+                            best_confidence = confidence
+                    except Exception:
+                        continue
+
+            return _normalize_ocr_text(best_text), "ocr"
     except Exception as exc:
         logger.warning("Image OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
+
 
 def extract_scanned_pdf(path: Path) -> tuple[str, str]:
     pytesseract = configure_tesseract()
     if not pytesseract:
         return "", "ocr_unavailable"
-    config = ocr_language_config(pytesseract)
-    if not config:
+    base_config = ocr_language_config(pytesseract)
+    if not base_config:
         return "", "ocr_unavailable"
     try:
         import pypdfium2 as pdfium
-        from PIL import Image
         pages = []
         with pdfium.PdfDocument(str(path)) as pdf:
             for index in range(min(len(pdf), 20)):
@@ -320,7 +524,22 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                 bitmap = page.render(scale=2)
                 try:
                     with bitmap.to_pil() as image:
-                        pages.append(pytesseract.image_to_string(image, config=config))
+                        image = image.convert("RGB")
+                        best_text = ""
+                        best_confidence = -1.0
+                        for _name, variant in _pil_variants(image):
+                            try:
+                                text, confidence = _run_ocr(
+                                    pytesseract, variant, _psm_config(base_config, 6)
+                                )
+                                if confidence > best_confidence or (
+                                    confidence == best_confidence and len(text) > len(best_text)
+                                ):
+                                    best_text = text
+                                    best_confidence = confidence
+                            except Exception:
+                                continue
+                        pages.append(_normalize_ocr_text(best_text))
                 finally:
                     bitmap.close()
                     page.close()
@@ -328,6 +547,7 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
     except Exception as exc:
         logger.warning("Scanned PDF OCR failed (%s).", type(exc).__name__)
         return "", "ocr_unavailable"
+
 
 def get_ocr_languages() -> list[str]:
     pytesseract = configure_tesseract()
@@ -341,6 +561,7 @@ def get_ocr_languages() -> list[str]:
     except Exception as exc:
         logger.warning("Tesseract language detection failed (%s).", type(exc).__name__)
         return []
+
 
 def validate_signature(path: Path, suffix: str) -> bool:
     with path.open("rb") as stream:
