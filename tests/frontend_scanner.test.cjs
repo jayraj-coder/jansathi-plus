@@ -193,6 +193,63 @@ test('disabling Auto Capture cancels pending analysis immediately and keeps manu
   assert.equal(detections, 0);
 });
 
+test('disabling Auto Capture while image encoding is pending suppresses its automatic capture', async () => {
+  const callbacks = new Map(), blobCallbacks = [];
+  let nextHandle = 0;
+  const f = setup();
+  const canvas = {
+    getContext: () => ({ drawImage() {} }),
+    toBlob: callback => blobCallbacks.push(callback),
+  };
+  const controller = createScannerController({
+    video: f.video, canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:pending', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: { x: .2, y: .12, width: .6, height: .76 } }),
+    onState: state => f.states.push(state),
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { sampleIntervalMs: 0, stableFrames: 1, stableDurationMs: 0 },
+  });
+  await controller.start();
+  const [id, frame] = [...callbacks.entries()][0]; callbacks.delete(id); frame(100);
+  assert.equal(blobCallbacks.length, 1);
+  controller.setAutoCapture(false);
+  blobCallbacks.shift()(new Blob([new Uint8Array(2200)], { type: 'image/jpeg' }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.states.some(state => state.phase === 'preview'), false);
+  assert.equal(f.tracks[0].stopped, false, 'camera remains available for manual capture');
+  const manualCapture = controller.capture();
+  blobCallbacks.shift()(new Blob([new Uint8Array(2200)], { type: 'image/jpeg' }));
+  assert.equal(await manualCapture, true);
+  assert.equal(f.states.at(-1).phase, 'preview');
+});
+
+test('backgrounding the tab resets stability and resumes detection when visible', async () => {
+  const callbacks = new Map(), listeners = new Map();
+  let nextHandle = 0;
+  const f = setup();
+  const document = {
+    visibilityState: 'visible',
+    addEventListener(name, callback) { listeners.set(name, callback); },
+    removeEventListener(name) { listeners.delete(name); },
+  };
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices, document,
+    detectFrame: () => ({ status: 'Document detected', box: { x: .2, y: .12, width: .6, height: .76 } }),
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+  });
+  await controller.start();
+  assert.equal(callbacks.size, 1);
+  document.visibilityState = 'hidden'; listeners.get('visibilitychange')();
+  assert.equal(callbacks.size, 0);
+  document.visibilityState = 'visible'; listeners.get('visibilitychange')();
+  assert.equal(callbacks.size, 1);
+  controller.dispose();
+  assert.equal(listeners.size, 0);
+});
+
 test('Auto Capture uploads exactly once after capture and reports upload progress', async () => {
   const callbacks = new Map();
   let nextHandle = 0, uploads = 0, completions = 0, lastFile;

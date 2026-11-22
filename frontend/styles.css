@@ -50,6 +50,11 @@ body.modal-open{overflow:hidden}
 .doc-name button{overflow-wrap:anywhere}
 .detail-header>div:last-child{min-width:0;overflow-wrap:anywhere}
 .detail-overview p,.message-bubble{overflow-wrap:anywhere;word-break:break-word}
+.detail-modal{max-height:min(92dvh,900px);overflow-y:auto}
+.detail-overview p,.detail-full-text pre{overflow-wrap:anywhere;word-break:normal;white-space:pre-wrap;line-height:1.75}
+.detail-full-text{border:1px solid var(--line);border-radius:10px;margin:0 0 20px;padding:13px 15px}
+.detail-full-text summary{cursor:pointer;color:var(--text);font-size:13px;font-weight:600}
+.detail-full-text pre{max-height:38dvh;overflow:auto;margin:12px 0 0;color:var(--muted);font:inherit;font-size:13px;unicode-bidi:plaintext}
 .chat-layout,.chat-main,.chat-compose,.main-panel,.top-actions{min-width:0}
 .search-wrap input{min-width:0;width:100%}
 @media(max-width:1000px){.orbit-one{width:370px;height:250px}.orbit-two{width:260px;height:360px}.hero-visual:before{inset:2% 0}}

@@ -474,7 +474,7 @@ def test_ocr_subprocess_timeout_is_capped_by_document_deadline():
     assert 0 < seen["timeout"] <= 0.4
 
 
-def test_scanned_pdf_starts_with_one_preprocessed_psm6_pass(tmp_path, monkeypatch):
+def test_scanned_pdf_runs_one_preprocessed_psm6_pass_for_all_pages(tmp_path, monkeypatch):
     import sys
 
     class Bitmap:
@@ -494,6 +494,9 @@ def test_scanned_pdf_starts_with_one_preprocessed_psm6_pass(tmp_path, monkeypatc
             pass
 
     class Page:
+        def get_size(self):
+            return (240, 120)
+
         def render(self, scale=1):
             assert scale == 2
             return Bitmap()
@@ -512,10 +515,10 @@ def test_scanned_pdf_starts_with_one_preprocessed_psm6_pass(tmp_path, monkeypatc
             return False
 
         def __len__(self):
-            return 1
+            return 21
 
         def __getitem__(self, index):
-            assert index == 0
+            assert 0 <= index < 21
             return Page()
 
     monkeypatch.setitem(sys.modules, "pypdfium2", SimpleNamespace(PdfDocument=Pdf))
@@ -523,14 +526,16 @@ def test_scanned_pdf_starts_with_one_preprocessed_psm6_pass(tmp_path, monkeypatc
     monkeypatch.setattr(api, "ocr_language_config", lambda _: "-l eng")
     calls = []
 
-    def run_ocr(_pytesseract, _image, config):
-        calls.append(config)
+    def run_ocr(_pytesseract, _image, config, **kwargs):
+        calls.append((config, kwargs.get("purpose")))
         return "PUBLIC NOTICE", 90
 
     monkeypatch.setattr(api, "_run_ocr", run_ocr)
     result = api.extract_scanned_pdf(tmp_path / "scan.pdf")
-    assert result == ("PUBLIC NOTICE", "pdf_ocr")
-    assert calls == ["-l eng --psm 6"]
+    assert result == ("\n".join(["PUBLIC NOTICE"] * 21), "pdf_ocr")
+    assert calls == [
+        ("-l eng --psm 6", f"pdf_page_{page}_psm6") for page in range(1, 22)
+    ]
 
 
 def test_real_tesseract_subprocess_timeout_terminates_process_and_cleans_temp_files(tmp_path, monkeypatch):
@@ -665,7 +670,12 @@ def _fake_extract_text(monkeypatch, text="extracted content", label="ocr"):
 
 def _make_upload_file(tmp_path, name, content_bytes):
     p = tmp_path / name
-    p.write_bytes(content_bytes)
+    if p.suffix.lower() in {".png", ".jpg", ".jpeg"} and content_bytes.startswith(
+        (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
+    ):
+        Image.new("RGB", (16, 16), "white").save(p, format="PNG" if p.suffix.lower() == ".png" else "JPEG")
+    else:
+        p.write_bytes(content_bytes)
     return p
 
 
@@ -759,6 +769,38 @@ def test_upload_ocr_timeout_returns_504(tmp_path, monkeypatch):
     assert "timed out" in r.json()["detail"].lower()
 
 
+def test_request_deadline_does_not_unlink_image_while_worker_is_still_reading(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    started = threading.Event()
+    observed_path = threading.Event()
+    worker_path = []
+    retained_while_running = []
+
+    def slow_extract(path, suffix):
+        worker_path.append(path)
+        started.set()
+        time.sleep(0.08)
+        retained_while_running.append(path.exists())
+        observed_path.set()
+        time.sleep(0.12)
+        return "finished", "ocr"
+
+    monkeypatch.setattr(api, "extract_text", slow_extract)
+    monkeypatch.setattr(api, "UPLOAD_OCR_TIMEOUT", 0.03)
+    client = TestClient(api.app)
+    image = _make_upload_file(tmp_path, "slow.jpg", b"\xff\xd8\xff\xe0fake jpg")
+    with image.open("rb") as stream:
+        response = client.post("/api/documents", files={"file": (image.name, stream, "image/jpeg")}, headers=GUEST)
+    assert response.status_code == 504
+    assert started.is_set()
+    assert observed_path.wait(1)
+    assert retained_while_running == [True], "the active worker must retain its source file"
+    time.sleep(0.15)
+    assert not worker_path[0].exists(), "the timed-out worker's file is cleaned after it exits"
+
+
 def test_upload_ocr_subprocess_deadline_returns_504(tmp_path, monkeypatch):
     def timeout(path, suffix):
         raise api.OCRProcessingTimeout("Tesseract process timeout")
@@ -842,6 +884,7 @@ def test_upload_sequential_uploads_get_unique_ids(tmp_path, monkeypatch):
 
 def test_concurrent_uploads_and_list_keep_event_loop_responsive(tmp_path, monkeypatch):
     import asyncio
+    import io
     import time
     import httpx
 
@@ -850,13 +893,16 @@ def test_concurrent_uploads_and_list_keep_event_loop_responsive(tmp_path, monkey
         return "concurrent OCR", "ocr"
 
     monkeypatch.setattr(api, "extract_text", slow_extract)
+    sample = io.BytesIO()
+    Image.new("RGB", (16, 16), "white").save(sample, format="JPEG")
+    jpeg_bytes = sample.getvalue()
 
     async def exercise():
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             async def upload(name):
                 return await client.post("/api/documents", headers=GUEST,
-                                         files={"file": (name, b"\xff\xd8\xffimage", "image/jpeg")})
+                                         files={"file": (name, jpeg_bytes, "image/jpeg")})
             first = asyncio.create_task(upload("first.jpg"))
             second = asyncio.create_task(upload("second.jpg"))
             await asyncio.sleep(0.05)
@@ -869,8 +915,32 @@ def test_concurrent_uploads_and_list_keep_event_loop_responsive(tmp_path, monkey
     asyncio.run(exercise())
 
 
+def test_ocr_process_slot_bounds_parallel_cpu_work():
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def recognize():
+        nonlocal active, maximum_active
+        with api._ocr_process_slot():
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.04)
+            with lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(lambda _: recognize(), range(4)))
+    assert 1 <= maximum_active <= api.OCR_MAX_CONCURRENT
+
+
 def test_upload_response_preserves_full_text(tmp_path, monkeypatch):
-    long_text = "word " * 10000
+    long_text = "word " * 100001
     _fake_extract_text(monkeypatch, long_text, "ocr")
     client = TestClient(api.app)
     img = _make_upload_file(tmp_path, "doc.jpg", b"\xff\xd8\xff\xe0fake jpg")
@@ -878,7 +948,24 @@ def test_upload_response_preserves_full_text(tmp_path, monkeypatch):
         r = client.post("/api/documents", files={"file": ("doc.jpg", f, "image/jpeg")}, headers=GUEST)
     assert r.status_code == 200, r.text
     data = r.json()
+    assert data["ai_summary"] is None
+    assert data["overview"]
+    assert data["processing_metadata"]["timings_ms"] == {}
     doc_id = data["id"]
     detail = client.get(f"/api/documents/{doc_id}", headers=GUEST)
     assert detail.status_code == 200, detail.text
-    assert detail.json()["text"] == long_text[:500_000]
+    assert detail.json()["text"] == long_text
+    assert detail.json()["overview"] != detail.json()["text"]
+    assert len(detail.json()["text"]) > 500_000
+    assert detail.json()["overview"] == r.json()["overview"]
+
+
+def test_upload_rejects_image_pixel_count_above_ocr_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "MAX_OCR_PIXELS", 10)
+    client = TestClient(api.app)
+    image = tmp_path / "oversized.jpg"
+    Image.new("RGB", (4, 4), "white").save(image, format="JPEG")
+    with image.open("rb") as stream:
+        response = client.post("/api/documents", files={"file": (image.name, stream, "image/jpeg")}, headers=GUEST)
+    assert response.status_code == 413
+    assert "dimensions" in response.json()["detail"]

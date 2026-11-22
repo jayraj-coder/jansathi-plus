@@ -172,6 +172,8 @@
     const cancelFrame = options.cancelAnimationFrame ?? globalThis.cancelAnimationFrame?.bind(globalThis);
     const now = options.now ?? (() => globalThis.performance?.now?.() ?? Date.now());
     const detectorSettings = { ...DETECTOR_DEFAULTS, ...(options.detectorSettings || {}) };
+    const documentRef = options.document ?? globalThis.document;
+    const pageVisible = () => !documentRef || documentRef.visibilityState !== 'hidden';
     let stream = null;
     let previewUrl = null;
     let capturedFile = null;
@@ -240,9 +242,9 @@
     }
 
     function detectionLoop(requestId) {
-      if (requestId !== generation || !stream || !autoCapture || capturePending || !requestFrame) return;
+      if (requestId !== generation || !stream || !autoCapture || capturePending || !pageVisible() || !requestFrame) return;
       frameHandle = requestFrame(timestamp => {
-        if (requestId !== generation || !stream || !autoCapture || capturePending) return;
+        if (requestId !== generation || !stream || !autoCapture || capturePending || !pageVisible()) return;
         const time = Number.isFinite(timestamp) ? timestamp : now();
         if (!lastSample || time - lastSample >= detectorSettings.sampleIntervalMs) {
           lastSample = time;
@@ -262,7 +264,7 @@
             if (status === 'Capturing automatically...') {
               capturePending = true;
               stopDetection();
-              void capture();
+              void capture(true);
               return;
             }
           } else {
@@ -356,7 +358,8 @@
       }
     }
 
-    async function capture() {
+    async function capture(autoTriggered = false) {
+      if (autoTriggered && !autoCapture) return false;
       if (captureInProgress === generation || !stream || !video?.videoWidth || !video?.videoHeight) return false;
       const requestId = generation;
       captureInProgress = requestId;
@@ -389,7 +392,12 @@
         publish('error', 'The camera image could not be prepared. Choose a photo instead.');
         return false;
       }
-      if (requestId !== generation) { if (captureInProgress === requestId) captureInProgress = null; return false; }
+      if (requestId !== generation || (autoTriggered && !autoCapture)) {
+        if (captureInProgress === requestId) captureInProgress = null;
+        capturePending = false;
+        if (requestId === generation && autoCapture) detectionLoop(requestId);
+        return false;
+      }
       if (!blob) {
         if (captureInProgress === requestId) captureInProgress = null;
         stopTracks();
@@ -453,7 +461,15 @@
       stopDetection(); capturePending = false; captureInProgress = null;
       stopTracks();
       releasePreview();
+      documentRef?.removeEventListener?.('visibilitychange', handleVisibilityChange);
     }
+
+    function handleVisibilityChange() {
+      stopDetection();
+      if (pageVisible() && stream && autoCapture && !capturePending) detectionLoop(generation);
+    }
+
+    documentRef?.addEventListener?.('visibilitychange', handleVisibilityChange);
 
     return { start, capture, usePhoto, confirm, close, dispose, setAutoCapture,
       retryUpload, analyzeDocumentFrame };

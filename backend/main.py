@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,9 +60,13 @@ _TESSERACT_CACHE = None
 _OCR_LANGUAGE_CACHE: dict[str, list[str]] = {}
 OCR_SUBPROCESS_TIMEOUT = float(os.getenv("OCR_SUBPROCESS_TIMEOUT", "25"))
 OCR_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "90"))
-OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "2")))
+OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "1")))
 OCR_QUEUE_TIMEOUT = float(os.getenv("OCR_QUEUE_TIMEOUT", "10"))
 _OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
+_DOCUMENT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(4, min(8, OCR_MAX_CONCURRENT + 2)),
+    thread_name_prefix="document-extract",
+)
 # Tesseract can start several OpenMP workers per invocation.  The upload
 # semaphore already controls process concurrency, so make the per-process CPU
 # budget deterministic even if the host image exports a larger value.
@@ -442,7 +447,10 @@ def _adaptive_threshold(image: Image.Image, block_size: int = 15, offset: float 
 
 
 MAX_OCR_DIMENSION = 1600
-UPLOAD_OCR_TIMEOUT = 110.0  # seconds; keeps uploads from blocking indefinitely
+MAX_OCR_PIXELS = 40_000_000
+# Keep the request deadline close to the extraction deadline and below the
+# browser's 100 second XHR deadline. Tesseract itself remains bounded per child.
+UPLOAD_OCR_TIMEOUT = min(95.0, OCR_DOCUMENT_TIMEOUT + 5.0)
 
 
 def _bound_dimensions(image: Image.Image) -> Image.Image:
@@ -452,6 +460,19 @@ def _bound_dimensions(image: Image.Image) -> Image.Image:
         scale = MAX_OCR_DIMENSION / float(max(w, h))
         return image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     return image
+
+
+def _validate_image_dimensions(path: Path, suffix: str) -> None:
+    """Reject oversized raster headers before Pillow decodes their pixel data."""
+    if suffix not in {".png", ".jpg", ".jpeg"}:
+        return
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(422, "The image is invalid or could not be decoded.") from exc
+    if width <= 0 or height <= 0 or width * height > MAX_OCR_PIXELS:
+        raise HTTPException(413, "Image dimensions exceed the OCR processing limit.")
 
 
 def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
@@ -736,6 +757,8 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
                      confidence=f"{best_confidence:.1f}", chars=len(normalized))
             return normalized, "ocr"
     except OCRProcessingTimeout:
+        _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
+                 level=logging.ERROR, result="timeout")
         raise
     except Exception as exc:
         _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
@@ -758,15 +781,18 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
         import pypdfium2 as pdfium
         pages = []
         with pdfium.PdfDocument(str(path)) as pdf:
-            for index in range(min(len(pdf), 20)):
+            for index in range(len(pdf)):
                 if _OCR_DEADLINE.get() is not None and time.perf_counter() >= _OCR_DEADLINE.get():
                     raise OCRProcessingTimeout("OCR document deadline exceeded")
                 page_started = time.perf_counter()
                 loading_started = time.perf_counter()
                 page = pdf[index]
-                bitmap = page.render(scale=2)
+                page_width, page_height = page.get_size()
+                page_scale = min(2.0, MAX_OCR_DIMENSION / max(page_width, page_height, 1))
+                bitmap = page.render(scale=page_scale)
                 _ocr_log("image_loading", time.perf_counter() - loading_started,
-                         pdf_page=index + 1, size=f"{bitmap.width}x{bitmap.height}")
+                         pdf_page=index + 1, size=f"{bitmap.width}x{bitmap.height}",
+                         render_scale=f"{page_scale:.3f}")
                 try:
                     with bitmap.to_pil() as image:
                         image = image.convert("RGB")
@@ -780,14 +806,22 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                         best_text = ""
                         best_confidence = -1.0
                         with _ocr_process_slot():
-                            text, confidence = _run_ocr(
-                                pytesseract, variant, _psm_config(base_config, 6)
-                            )
+                            psm_started = time.perf_counter()
+                            try:
+                                text, confidence = _run_ocr(
+                                    pytesseract, variant, _psm_config(base_config, 6),
+                                    purpose=f"pdf_page_{index + 1}_psm6",
+                                )
+                            finally:
+                                _ocr_log("psm_execution", time.perf_counter() - psm_started,
+                                         pdf_page=index + 1, mode=6)
                             best_text, best_confidence = text, confidence
                             if confidence < CONFIDENCE_FLOOR:
+                                fallback_started = time.perf_counter()
                                 try:
                                     fallback_text, fallback_confidence = _run_ocr(
-                                        pytesseract, variant, _psm_config(base_config, 11)
+                                        pytesseract, variant, _psm_config(base_config, 11),
+                                        purpose=f"pdf_page_{index + 1}_low_confidence_psm11",
                                     )
                                     if fallback_confidence > best_confidence or (
                                         fallback_confidence == best_confidence and len(fallback_text) > len(best_text)
@@ -798,6 +832,9 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                                 except Exception as exc:
                                     _ocr_log("psm_execution", level=logging.WARNING,
                                              pdf_page=index + 1, mode=11, result=type(exc).__name__)
+                                finally:
+                                    _ocr_log("psm_execution", time.perf_counter() - fallback_started,
+                                             pdf_page=index + 1, mode=11)
                             target_language = _dominant_indic_language(best_text)
                             if target_language:
                                 language_started = time.perf_counter()
@@ -822,7 +859,11 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
                                     _ocr_log("language_disambiguation", time.perf_counter() - language_started,
                                              level=logging.WARNING, pdf_page=index + 1,
                                              target=target_language, result=type(exc).__name__)
-                        pages.append(_normalize_ocr_text(best_text))
+                        normalization_started = time.perf_counter()
+                        normalized_page = _normalize_ocr_text(best_text)
+                        _ocr_log("text_normalization", time.perf_counter() - normalization_started,
+                                 pdf_page=index + 1, chars=len(normalized_page))
+                        pages.append(normalized_page)
                         _ocr_log("pdf_page_ocr", time.perf_counter() - page_started,
                                  pdf_page=index + 1, chars=len(best_text),
                                  confidence=f"{best_confidence:.1f}")
@@ -962,6 +1003,7 @@ async def upload_document(request: Request, response: Response, file: UploadFile
     safe_name = re.sub(r"[^\w. -]", "_", name).strip(" .") or "document"
     target = STORAGE / f"{doc_id}{suffix}"
     size = 0
+    defer_file_cleanup = False
     try:
         with target.open("wb") as out:
             while chunk := await file.read(1024 * 1024):
@@ -971,31 +1013,51 @@ async def upload_document(request: Request, response: Response, file: UploadFile
                 out.write(chunk)
         if not validate_signature(target, suffix):
             raise HTTPException(415, "The file content does not match its extension.")
+        await run_in_threadpool(_validate_image_dimensions, target, suffix)
         logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
         upload_context = _OCR_UPLOAD_ID.set(doc_id)
         deadline_context = _OCR_DEADLINE.set(time.perf_counter() + OCR_DOCUMENT_TIMEOUT)
         timings: dict[str, float] = {}
         timings_context = _OCR_TIMINGS.set(timings)
+        extraction_context = contextvars.copy_context()
+        extraction_future = _DOCUMENT_EXECUTOR.submit(
+            extraction_context.run, extract_text, target, suffix
+        )
         try:
             text, extraction = await asyncio.wait_for(
-                run_in_threadpool(extract_text, target, suffix), timeout=UPLOAD_OCR_TIMEOUT
+                asyncio.wrap_future(extraction_future), timeout=UPLOAD_OCR_TIMEOUT
             )
         except OCRProcessingTimeout as exc:
             target.unlink(missing_ok=True)
             logger.error("Upload %s: OCR subprocess deadline reached (%s)", doc_id, type(exc).__name__)
             raise HTTPException(504, "Document OCR timed out. Please try a smaller or simpler file.")
         except asyncio.TimeoutError:
-            target.unlink(missing_ok=True)
-            logger.error("Upload %s: OCR/text extraction timed out after %ss", doc_id, UPLOAD_OCR_TIMEOUT)
+            defer_file_cleanup = True
+            def cleanup_timed_out_extraction(_future) -> None:
+                target.unlink(missing_ok=True)
+
+            extraction_future.add_done_callback(cleanup_timed_out_extraction)
+            logger.error("Upload %s: OCR/text extraction request deadline reached after %ss",
+                         doc_id, UPLOAD_OCR_TIMEOUT)
             raise HTTPException(504, "Document processing timed out. Please try a smaller or simpler file.")
         finally:
             _OCR_UPLOAD_ID.reset(upload_context)
             _OCR_DEADLINE.reset(deadline_context)
             _OCR_TIMINGS.reset(timings_context)
-        text = text[:500_000]
         logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
-        record = {"id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name, "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size, "created_at": datetime.now(timezone.utc).isoformat(), "status": status, "language": detect_document_language(text), "extraction": extraction, "text": text, "overview": simple_summary(text), "path": str(target)}
+        record = {
+            "id": doc_id, "owner_id": owner_id, "title": safe_name, "filename": safe_name,
+            "file_type": suffix[1:].upper(), "mime_type": MIME[suffix], "size": size,
+            "created_at": datetime.now(timezone.utc).isoformat(), "status": status,
+            "ocr_status": status, "language": detect_document_language(text),
+            "extraction": extraction, "text": text, "overview": simple_summary(text),
+            "ai_summary": None,
+            "processing_metadata": {
+                "timings_ms": {stage: round(duration_ms, 1) for stage, duration_ms in timings.items()},
+            },
+            "path": str(target),
+        }
         save_doc(record)
         logger.info("Upload %s: saved (status=%s)", doc_id, status)
         if timings:
@@ -1005,13 +1067,15 @@ async def upload_document(request: Request, response: Response, file: UploadFile
             )
         return public_document(record)
     except HTTPException:
-        target.unlink(missing_ok=True)
+        if not defer_file_cleanup:
+            target.unlink(missing_ok=True)
         raise
     except PyMongoError as exc:
         target.unlink(missing_ok=True)
         raise HTTPException(503, "Document storage is currently unavailable.") from exc
     except Exception as exc:
-        target.unlink(missing_ok=True)
+        if not defer_file_cleanup:
+            target.unlink(missing_ok=True)
         raise HTTPException(422, f"Document processing failed: {type(exc).__name__}.") from exc
 
 @app.get("/api/documents")
