@@ -5,9 +5,44 @@
   const DETECTOR_DEFAULTS = Object.freeze({
     width: 112, height: 144, minArea: 0.12, maxArea: 0.92,
     minBrightness: 68, minPageBrightness: 105, maxPageBrightness: 250, minSharpness: 36,
+    minConfidence: 0.55,
     stableFrames: 6, stableDurationMs: 850, maxCenterDrift: 0.03,
     maxSizeDrift: 0.045, sampleIntervalMs: 160,
   });
+
+  function quadrilateralFromPixels(pixels, width, active) {
+    if (!pixels?.length) return null;
+    let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+    let topLeft, topRight, bottomRight, bottomLeft;
+    for (const index of pixels) {
+      const x = index % width, y = (index / width) | 0, sum = x + y, diff = x - y;
+      if (sum < minSum) { minSum = sum; topLeft = [x, y]; }
+      if (sum > maxSum) { maxSum = sum; bottomRight = [x, y]; }
+      if (diff > maxDiff) { maxDiff = diff; topRight = [x, y]; }
+      if (diff < minDiff) { minDiff = diff; bottomLeft = [x, y]; }
+    }
+    const raw = [topLeft, topRight, bottomRight, bottomLeft];
+    if (raw.some(point => !point) || new Set(raw.map(point => point.join(','))).size !== 4) return null;
+    const cross = raw.map((point, i) => {
+      const next = raw[(i + 1) % 4], after = raw[(i + 2) % 4];
+      return (next[0] - point[0]) * (after[1] - next[1]) -
+        (next[1] - point[1]) * (after[0] - next[0]);
+    });
+    if (cross.some(value => value <= 0)) return null;
+    let twiceArea = 0;
+    for (let i = 0; i < 4; i++) {
+      const next = raw[(i + 1) % 4];
+      twiceArea += raw[i][0] * next[1] - next[0] * raw[i][1];
+    }
+    const area = Math.abs(twiceArea) / 2;
+    return {
+      corners: raw.map(([x, y]) => ({
+        x: (x - active.left) / active.width,
+        y: (y - active.top) / active.height,
+      })),
+      area,
+    };
+  }
 
   // Adaptive luminance regions tolerate colored paper, printed texture, a
   // center gutter and mildly curved book pages. Region texture and Laplacian
@@ -76,10 +111,12 @@
     for (let seed = 0; seed < total; seed++) {
       if (!mask[seed] || seen[seed]) continue;
       let top = 0, minX = cfg.width, minY = cfg.height, maxX = -1, maxY = -1, count = 0;
+      const pixels = [];
       stack[top++] = seed;
       seen[seed] = 1;
       while (top) {
         const index = stack[--top], x = index % cfg.width, y = (index / cfg.width) | 0;
+        pixels.push(index);
         count++;
         if (x < minX) minX = x; if (x > maxX) maxX = x;
         if (y < minY) minY = y; if (y > maxY) maxY = y;
@@ -90,7 +127,7 @@
         if (up >= 0 && mask[up] && !seen[up]) { seen[up] = 1; stack[top++] = up; }
         if (down >= 0 && mask[down] && !seen[down]) { seen[down] = 1; stack[top++] = down; }
       }
-      if (count / activeArea >= 0.035) regions.push({ minX, minY, maxX, maxY, count });
+      if (count / activeArea >= 0.035) regions.push({ minX, minY, maxX, maxY, count, pixels });
     }
     if (!regions.length) return { status: 'Looking for document...' };
 
@@ -106,7 +143,7 @@
       if (gapX <= active.width * 0.1 && sharedHeight >= 0.55) candidates.push({
         minX: Math.min(first.minX, second.minX), minY: Math.min(first.minY, second.minY),
         maxX: Math.max(first.maxX, second.maxX), maxY: Math.max(first.maxY, second.maxY),
-        count: first.count + second.count,
+        count: first.count + second.count, pixels: first.pixels.concat(second.pixels),
       });
     }
     candidates.sort((a, b) => b.count - a.count);
@@ -120,7 +157,9 @@
       if (region.minX < active.left + 2 || region.minY < active.top + 2 ||
           region.maxX >= active.right - 2 || region.maxY >= active.bottom - 2 ||
           box.x < 0.06 || box.x + box.width > 0.94 || box.y < 0.05 || box.y + box.height > 0.95) continue;
-      if (!best || boxArea > best.area) best = { ...region, box, area: boxArea };
+      const quadrilateral = quadrilateralFromPixels(region.pixels, cfg.width, active);
+      if (!quadrilateral || quadrilateral.area / (width * height) < 0.58) continue;
+      if (!best || boxArea > best.area) best = { ...region, box, area: boxArea, quadrilateral };
     }
     if (!best) return regions.some(region => region.count / activeArea < cfg.minArea)
       ? { status: 'Move closer' } : { status: 'Position your document inside the frame' };
@@ -142,16 +181,28 @@
     const sharpness = lapSquared / Math.max(sampleCount, 1) - mean * mean;
     const normalizedPageLight = pageLuminance / Math.max(sampleCount, 1);
     const edgeDensity = edges / Math.max(sampleCount, 1);
+    const shapeRatio = Math.min(1, best.quadrilateral.area /
+      Math.max(1, (maxX - minX + 1) * (maxY - minY + 1)));
+    const confidence = Math.max(0, Math.min(1,
+      shapeRatio * 0.45 + Math.min(1, sharpness / (cfg.minSharpness * 8)) * 0.35 +
+      Math.min(1, edgeDensity / 0.04) * 0.2));
+    const detection = { box, corners: best.quadrilateral.corners, confidence, sharpness, edgeDensity };
     if (normalizedPageLight < cfg.minPageBrightness || normalizedPageLight > cfg.maxPageBrightness) {
-      return { status: 'Improve lighting', box };
+      return { status: 'Improve lighting', ...detection };
     }
-    if (edgeDensity < 0.004) return { status: 'Looking for document...', box };
-    if (sharpness < cfg.minSharpness) return { status: 'Image is blurry', box, sharpness };
-    return { status: 'Document detected', box, sharpness, edgeDensity };
+    if (edgeDensity < 0.004) return { status: 'Looking for document...', ...detection };
+    if (sharpness < cfg.minSharpness) return { status: 'Image is blurry', ...detection };
+    if (confidence < cfg.minConfidence) return { status: 'Keep the document inside the frame', ...detection };
+    return { status: 'Document detected', ...detection };
   }
 
   function boxesStable(previous, current, cfg = DETECTOR_DEFAULTS) {
     if (!previous || !current) return false;
+    if (Array.isArray(previous) && Array.isArray(current)) {
+      return previous.length === 4 && current.length === 4 && previous.every((point, index) =>
+        Math.abs(point.x - current[index].x) <= cfg.maxCenterDrift &&
+        Math.abs(point.y - current[index].y) <= cfg.maxCenterDrift);
+    }
     return ['x', 'y'].every(key => Math.abs(previous[key] - current[key]) <= cfg.maxCenterDrift) &&
       ['width', 'height'].every(key => Math.abs(previous[key] - current[key]) <= cfg.maxSizeDrift);
   }
@@ -192,9 +243,9 @@
     let autoCaptured = false;
     let uploadProgress = 0;
 
-    function publish(phase, error = '', status = '') {
+    function publish(phase, error = '', status = '', detection = null) {
       onState({ phase, error, status, autoCapture, file: capturedFile, previewUrl,
-        autoCaptured, uploadProgress });
+        autoCaptured, uploadProgress, detection });
     }
 
     async function uploadCapturedFile() {
@@ -252,24 +303,32 @@
           try { result = detectFrame(video, analysisCanvas, detectorSettings); }
           catch { result = { status: 'Position your document inside the frame' }; }
           let status = result?.status || 'Position your document inside the frame';
-          if (status === 'Document detected' && result.box) {
-            if (!boxesStable(previousBox, result.box, detectorSettings)) {
+          const geometry = result?.corners?.length === 4 ? result.corners : result?.box;
+          const confident = (result?.confidence ?? 1) >= detectorSettings.minConfidence;
+          if (status === 'Document detected' && result.box && geometry && confident) {
+            if (!boxesStable(previousBox, geometry, detectorSettings)) {
               stableSince = time; stableFrames = 1;
             } else stableFrames++;
-            previousBox = result.box;
+            previousBox = geometry;
             status = stableFrames >= detectorSettings.stableFrames &&
-              time - stableSince >= detectorSettings.stableDurationMs ? 'Capturing automatically...'
+              time - stableSince >= detectorSettings.stableDurationMs ? 'Document ready'
               : stableFrames === 1 ? 'Document detected' : 'Hold steady';
-            publish('live', '', status);
-            if (status === 'Capturing automatically...') {
+            publish('live', '', status, result);
+            if (status === 'Document ready') {
               capturePending = true;
               stopDetection();
-              void capture(true);
+              const captureOnNextPaint = () => {
+                if (requestId !== generation || !stream || !autoCapture || !capturePending) return;
+                publish('live', '', 'Capturing automatically...', result);
+                void capture(true);
+              };
+              if (requestFrame) requestFrame(captureOnNextPaint);
+              else captureOnNextPaint();
               return;
             }
           } else {
             stableSince = 0; stableFrames = 0; previousBox = null;
-            publish('live', '', status);
+            publish('live', '', status, result?.corners ? result : null);
           }
         }
         detectionLoop(requestId);
@@ -418,7 +477,6 @@
       if (captureInProgress === requestId) captureInProgress = null;
       autoCaptured = autoCapture && Boolean(onAutoUpload);
       publish('preview');
-      if (autoCaptured) void uploadCapturedFile();
       return true;
     }
 
@@ -438,6 +496,7 @@
 
     function confirm() {
       if (!capturedFile) return false;
+      if (autoCaptured && onAutoUpload) return uploadCapturedFile();
       const file = capturedFile;
       onConfirm(file);
       close();

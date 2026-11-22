@@ -117,7 +117,10 @@ test('document detector distinguishes missing page, poor light, and a well-frame
   const darkCanvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: syntheticFrame({ page: false, light: 30 }).pixels }; } }) };
   assert.equal(analyzeDocumentFrame(video, darkCanvas).status, 'Improve lighting');
   const pageCanvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: syntheticFrame({ light: 40 }).pixels }; } }) };
-  assert.equal(analyzeDocumentFrame(video, pageCanvas).status, 'Document detected');
+  const pageDetection = analyzeDocumentFrame(video, pageCanvas);
+  assert.equal(pageDetection.status, 'Document detected');
+  assert.equal(pageDetection.corners.length, 4);
+  assert.ok(pageDetection.confidence >= 0.55 && pageDetection.confidence <= 1);
   assert.equal(analyzeDocumentFrame(video, pageCanvas, { minSharpness: 1e9 }).status, 'Image is blurry');
   assert.equal(analyzeDocumentFrame(video, pageCanvas, { minArea: .55 }).status, 'Move closer');
 });
@@ -137,6 +140,27 @@ test('detector finds an open textbook spread across a dark central gutter', () =
   const result = analyzeDocumentFrame({ videoWidth: 480, videoHeight: 640 }, canvas);
   assert.equal(result.status, 'Document detected', JSON.stringify(result));
   assert.ok(result.box.width > .7, 'the two page regions merge into a spread-sized region');
+});
+
+test('detector reports a live four-corner outline for a rotated page', () => {
+  const width = 112, height = 144, pixels = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < width * height; i++) pixels.set([75, 75, 75, 255], i * 4);
+  const polygon = [[20, 22], [82, 12], [91, 120], [27, 131]];
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const inside = polygon.every((point, i) => {
+      const next = polygon[(i + 1) % polygon.length];
+      return (next[0] - point[0]) * (y - point[1]) - (next[1] - point[1]) * (x - point[0]) >= 0;
+    });
+    const line = (y % 12 === 0 && x > 30 && x < 80);
+    if (inside) pixels.set([line ? 55 : 232, line ? 55 : 232, line ? 55 : 232, 255], (y * width + x) * 4);
+  }
+  const canvas = { getContext: () => ({ clearRect() {}, drawImage() {}, getImageData() { return { data: pixels }; } }) };
+  const result = analyzeDocumentFrame({ videoWidth: 480, videoHeight: 640 }, canvas);
+  assert.equal(result.status, 'Document detected', JSON.stringify(result));
+  assert.equal(result.corners.length, 4);
+  assert.ok(result.corners[0].x < result.corners[1].x);
+  assert.ok(result.corners[1].y < result.corners[2].y);
+  assert.ok(result.corners.some(point => point.x > 0.7 && point.y < 0.2), 'top edge follows page rotation');
 });
 
 test('detector preserves landscape camera aspect ratio without cropping the frame', () => {
@@ -169,6 +193,7 @@ test('Auto Capture requires stable detections for the configured frame count and
   }
   assert.equal(f.tracks[0].stopped, false, 'five stable samples are insufficient');
   const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(1100);
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(1120);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.tracks[0].stopped, true);
   assert.equal(f.states.at(-1).phase, 'preview');
@@ -213,6 +238,7 @@ test('disabling Auto Capture while image encoding is pending suppresses its auto
   });
   await controller.start();
   const [id, frame] = [...callbacks.entries()][0]; callbacks.delete(id); frame(100);
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(120);
   assert.equal(blobCallbacks.length, 1);
   controller.setAutoCapture(false);
   blobCallbacks.shift()(new Blob([new Uint8Array(2200)], { type: 'image/jpeg' }));
@@ -273,6 +299,11 @@ test('Auto Capture uploads exactly once after capture and reports upload progres
   for (const time of [100, 250, 400, 550, 700, 850]) {
     const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
   }
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(870);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.states.at(-1).phase, 'preview', 'automatic capture opens review before upload');
+  assert.equal(uploads, 0, 'upload waits for explicit confirmation');
+  await controller.confirm();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(uploads, 1);
   assert.equal(completions, 1);
@@ -304,6 +335,10 @@ test('failed automatic upload retains its capture and retry uses the same file o
   for (const time of [100, 250, 400, 550, 700, 850]) {
     const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
   }
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(870);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.states.at(-1).phase, 'preview');
+  await controller.confirm();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.states.at(-1).phase, 'upload-error');
   assert.equal(f.states.at(-1).file, uploadedFile);
@@ -360,9 +395,13 @@ test('closing during automatic upload aborts the request and releases camera res
   for (const time of [100, 250, 400, 550, 700, 850]) {
     const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
   }
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(870);
+  await new Promise(resolve => setImmediate(resolve));
+  const uploading = controller.confirm();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.states.at(-1).phase, 'uploading');
   controller.close();
+  await uploading;
   assert.equal(requestSignal.aborted, true);
   assert.equal(f.tracks[0].stopped, true);
   assert.equal(f.states.at(-1).phase, 'closed');

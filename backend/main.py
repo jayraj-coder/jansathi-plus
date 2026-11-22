@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 import asyncio
 import httpx
@@ -299,6 +299,30 @@ def _probe_default_tessdata(executable: str) -> Path | None:
     return None
 
 
+def _terminate_and_reap(process: subprocess.Popen, code: int = -1) -> None:
+    """Terminate a timed-out Tesseract child and always wait for its exit."""
+    try:
+        process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        process.wait()
+
+
+def _install_tesseract_timeout_cleanup(pytesseract) -> None:
+    # pytesseract 0.3.13 can call Popen.kill() without waiting after terminate
+    # times out; reap explicitly to avoid leaving a zombie child on Linux.
+    module = getattr(pytesseract, "pytesseract", None)
+    if module is not None and getattr(module, "kill", None) is not _terminate_and_reap:
+        module.kill = _terminate_and_reap
+
+
 def configure_tesseract():
     global _OCR_TESSDATA_DIR, _TESSERACT_CACHE
     try:
@@ -306,6 +330,7 @@ def configure_tesseract():
     except ImportError as exc:
         logger.warning("OCR unavailable: pytesseract could not be imported (%s).", type(exc).__name__)
         return None
+    _install_tesseract_timeout_cleanup(pytesseract)
 
     if _TESSERACT_CACHE is not None:
         pytesseract.pytesseract.tesseract_cmd, _OCR_TESSDATA_DIR = _TESSERACT_CACHE
@@ -475,7 +500,8 @@ def _validate_image_dimensions(path: Path, suffix: str) -> None:
         raise HTTPException(413, "Image dimensions exceed the OCR processing limit.")
 
 
-def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
+def _pil_variants(image: Image.Image, include_fallbacks: bool = True, *,
+                  upscale: bool = True, denoise: bool = True, contrast: float = 2.0):
     """Return (name, PIL image) preprocessing variants.
 
     The original image is preserved unchanged. A restrained 1.5x upscale and
@@ -492,18 +518,20 @@ def _pil_variants(image: Image.Image, include_fallbacks: bool = True):
 
     w, h = grayscale.size
     base = grayscale
-    if UPSCALE_SMALL_IMAGE and max(w, h) < MIN_LONG_SIDE_FOR_UPSCALE:
+    if upscale and UPSCALE_SMALL_IMAGE and max(w, h) < MIN_LONG_SIDE_FOR_UPSCALE:
         base = grayscale.resize((round(w * UPSCALE_SCALE), round(h * UPSCALE_SCALE)), Image.LANCZOS)
 
     try:
-        contrasted = ImageEnhance.Contrast(base).enhance(2.0)
+        contrasted = ImageEnhance.Contrast(base).enhance(contrast)
     except Exception:
         contrasted = base
 
-    try:
-        denoised = contrasted.filter(ImageFilter.MedianFilter(size=3))
-    except Exception:
-        denoised = contrasted
+    denoised = contrasted
+    if denoise:
+        try:
+            denoised = contrasted.filter(ImageFilter.MedianFilter(size=3))
+        except Exception:
+            pass
 
     if not include_fallbacks:
         return [("enhanced_grayscale", denoised)]
@@ -670,12 +698,18 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
         return "", "ocr_unavailable"
     try:
         loading_started = time.perf_counter()
-        with Image.open(path) as image:
-            image = image.convert("RGB")
+        with Image.open(path) as source:
+            original_size = source.size
+            image = ImageOps.exif_transpose(source).convert("RGB")
             image = _bound_dimensions(image)
-        _ocr_log("image_loading", time.perf_counter() - loading_started, size=f"{image.width}x{image.height}")
+        _ocr_log("image_loading", time.perf_counter() - loading_started,
+                 original_size=f"{original_size[0]}x{original_size[1]}",
+                 size=f"{image.width}x{image.height}")
         preprocessing_started = time.perf_counter()
-        variants = _pil_variants(image, include_fallbacks=False)
+        # The first pass uses the camera's native pixels. Avoid a blind resize
+        # and median filter: both add work and can erase fine print at this size.
+        variants = _pil_variants(image, include_fallbacks=False,
+                                 upscale=False, denoise=False, contrast=1.45)
         _ocr_log("image_preprocessing", time.perf_counter() - preprocessing_started,
                  variant=variants[0][0], size=f"{variants[0][1].width}x{variants[0][1].height}")
         with _ocr_process_slot():
@@ -701,7 +735,15 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
             if best_confidence < CONFIDENCE_FLOOR:
                 fallback_started = time.perf_counter()
                 try:
-                    text, confidence = _run_ocr(pytesseract, variant,
+                    fallback_preprocess_started = time.perf_counter()
+                    fallback_variants = _pil_variants(
+                        image, include_fallbacks=False, upscale=True,
+                        denoise=True, contrast=1.8,
+                    )
+                    _ocr_log("image_preprocessing", time.perf_counter() - fallback_preprocess_started,
+                             variant="low_confidence_enhanced",
+                             size=f"{fallback_variants[0][1].width}x{fallback_variants[0][1].height}")
+                    text, confidence = _run_ocr(pytesseract, fallback_variants[0][1],
                                                 _psm_config(base_config, 11), purpose="low_confidence_psm11")
                     logger.info("OCR upload_id=%s stage=psm_execution mode=11 confidence=%.1f chars=%d",
                                 _OCR_UPLOAD_ID.get(), confidence, len(text))

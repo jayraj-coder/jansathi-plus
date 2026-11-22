@@ -70,6 +70,7 @@ def test_configure_tesseract_validates_candidate_and_discovers_local_models(tmp_
 
     assert pytesseract is not None
     assert pytesseract.pytesseract.tesseract_cmd == str(binary)
+    assert pytesseract.pytesseract.kill is api._terminate_and_reap
     assert api._OCR_TESSDATA_DIR == model_dir
 
 
@@ -394,6 +395,46 @@ def test_extract_image_ocr_falls_back_to_sparse_psm_when_confidence_low(tmp_path
     assert text == "MAN SEEKS PEACE"
 
 
+def test_image_ocr_uses_native_resolution_first_and_upscales_only_low_confidence_fallback(tmp_path, monkeypatch):
+    image_path = tmp_path / "small-camera.jpg"
+    _make_image(size=(466, 659)).save(image_path)
+    _install_mock_pytesseract(monkeypatch, {6: ("small text", 20), 11: ("small text recovered", 75)})
+    observed = []
+
+    def capture_dimensions(_pytesseract, image, config, **kwargs):
+        observed.append((image.size, config, kwargs["purpose"]))
+        return ("small text", 20) if "--psm 6" in config else ("small text recovered", 75)
+
+    monkeypatch.setattr(api, "_run_ocr", capture_dimensions)
+    text, label = api.extract_image_ocr(image_path)
+    assert label == "ocr"
+    assert text == "small text recovered"
+    assert observed == [
+        ((466, 659), "-l eng+hin+guj --psm 6", "primary_psm6"),
+        ((699, 988), "-l eng+hin+guj --psm 11", "low_confidence_psm11"),
+    ]
+
+
+def test_image_ocr_applies_exif_orientation_before_recognition(tmp_path, monkeypatch):
+    from PIL import Image
+
+    image_path = tmp_path / "rotated.jpg"
+    image = Image.new("RGB", (466, 659), "white")
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(image_path, exif=exif)
+    _install_mock_pytesseract(monkeypatch, {6: ("notice", 90)})
+    observed = []
+
+    def capture_dimensions(_pytesseract, candidate, _config, **_kwargs):
+        observed.append(candidate.size)
+        return "notice", 90
+
+    monkeypatch.setattr(api, "_run_ocr", capture_dimensions)
+    assert api.extract_image_ocr(image_path) == ("notice", "ocr")
+    assert observed == [(659, 466)]
+
+
 def test_subprocess_timeout_during_psm_fallback_stops_all_later_passes(tmp_path, monkeypatch):
     image_path = tmp_path / "timeout-fallback.png"
     _make_image(size=(300, 120)).save(image_path)
@@ -573,6 +614,7 @@ int main(void) {
     except subprocess.CalledProcessError:
         pytest.skip("gcc is installed but cannot link the test executable on this host")
     monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(executable))
+    monkeypatch.setattr(pytesseract.pytesseract, "kill", api._terminate_and_reap)
     monkeypatch.setattr(api, "OCR_SUBPROCESS_TIMEOUT", 0.5)
     monkeypatch.setenv("OCR_TEST_PID_FILE", str(pid_file))
     image = Image.new("RGB", (20, 20), "white")
@@ -597,6 +639,7 @@ def test_real_child_process_is_killed_by_pytesseract_timeout_manager():
         [sys.executable, "-c", "import time; time.sleep(30)"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+    pytesseract.pytesseract.kill = api._terminate_and_reap
     with pytest.raises(RuntimeError, match="timeout"):
         with pytesseract.pytesseract.timeout_manager(process, 0.4):
             pass
