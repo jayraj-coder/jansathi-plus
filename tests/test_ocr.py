@@ -564,7 +564,7 @@ def test_scanned_pdf_runs_one_preprocessed_psm6_pass_for_all_pages(tmp_path, mon
 
     monkeypatch.setitem(sys.modules, "pypdfium2", SimpleNamespace(PdfDocument=Pdf))
     monkeypatch.setattr(api, "configure_tesseract", lambda: SimpleNamespace())
-    monkeypatch.setattr(api, "ocr_language_config", lambda _: "-l eng")
+    monkeypatch.setattr(api, "ocr_language_config", lambda *_: "-l eng")
     calls = []
 
     def run_ocr(_pytesseract, _image, config, **kwargs):
@@ -651,6 +651,31 @@ def test_ocr_language_config_reports_english_hindi_gujarati(monkeypatch):
     monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
     config = api.ocr_language_config(m)
     assert config == "-l eng+hin+guj"
+
+
+@pytest.mark.parametrize(("hint", "languages"), [
+    ("en", "eng+hin"), ("hi", "eng+hin"), ("gu", "eng+guj"),
+])
+def test_language_hint_uses_bilingual_models_without_dropping_regional_script(monkeypatch, hint, languages):
+    m = SimpleNamespace(
+        get_languages=lambda config="": ["eng", "hin", "guj"],
+        pytesseract=SimpleNamespace(tesseract_cmd="mock"),
+    )
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    monkeypatch.setattr(api, "OCR_LANGS", ["eng", "hin", "guj"])
+    monkeypatch.setattr(api, "_OCR_LANGUAGE_CACHE", {})
+    assert api.ocr_language_config(m, hint) == f"-l {languages}"
+
+
+def test_missing_hint_language_data_falls_back_to_installed_language_subset(monkeypatch):
+    m = SimpleNamespace(
+        get_languages=lambda config="": ["eng", "hin"],
+        pytesseract=SimpleNamespace(tesseract_cmd="mock"),
+    )
+    monkeypatch.setattr(api, "_OCR_TESSDATA_DIR", None)
+    monkeypatch.setattr(api, "OCR_LANGS", ["eng", "hin", "guj"])
+    monkeypatch.setattr(api, "_OCR_LANGUAGE_CACHE", {})
+    assert api.ocr_language_config(m, "gu") == "-l eng+hin"
 
 
 def test_extract_image_ocr_missing_tesseract_returns_unavailable(tmp_path, monkeypatch):
@@ -993,7 +1018,7 @@ def test_upload_response_preserves_full_text(tmp_path, monkeypatch):
     data = r.json()
     assert data["ai_summary"] is None
     assert data["overview"]
-    assert data["processing_metadata"]["timings_ms"] == {}
+    assert set(data["processing_metadata"]["timings_ms"]) == {"ocr_work_queue"}
     doc_id = data["id"]
     detail = client.get(f"/api/documents/{doc_id}", headers=GUEST)
     assert detail.status_code == 200, detail.text

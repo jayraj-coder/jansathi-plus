@@ -245,7 +245,7 @@
 
     function publish(phase, error = '', status = '', detection = null) {
       onState({ phase, error, status, autoCapture, file: capturedFile, previewUrl,
-        autoCaptured, uploadProgress, detection });
+        autoCaptured, uploadProgress, uploadRetryable: uploadFailed, detection });
     }
 
     async function uploadCapturedFile() {
@@ -277,7 +277,7 @@
       } catch (error) {
         if (requestId !== generation || controller.signal.aborted) return false;
         uploadInProgress = false;
-        uploadFailed = true;
+        uploadFailed = error?.retryable !== false;
         uploadController = null;
         publish('upload-error', error?.message || 'Upload failed. Retry or retake the image.');
         return false;

@@ -8,6 +8,7 @@ import subprocess
 import uuid
 import logging
 import contextvars
+import functools
 from contextlib import contextmanager
 import threading
 import time
@@ -40,6 +41,14 @@ MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 ALLOWED = {".pdf", ".txt", ".docx", ".png", ".jpg", ".jpeg"}
 MIME = {".pdf": "application/pdf", ".txt": "text/plain", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 OCR_LANGS = [language.strip() for language in os.getenv("TESSERACT_LANGS", "eng+hin+guj").split("+") if language.strip()]
+OCR_HINT_LANGUAGES = {
+    # English UI is the default for this India-focused app; use a bilingual
+    # English/Hindi model set unless the user selects Gujarati in the existing
+    # language menu. All three models remain installed and available.
+    "en": ("eng", "hin"),
+    "hi": ("eng", "hin"),
+    "gu": ("eng", "guj"),
+}
 TESSDATA_DIR = Path(os.getenv("TESSDATA_DIR", ROOT / "data" / "tessdata"))
 if not TESSDATA_DIR.is_absolute():
     TESSDATA_DIR = ROOT / TESSDATA_DIR
@@ -54,6 +63,7 @@ SYSTEM_TESSDATA_DIRS = (
 _OCR_UPLOAD_ID = contextvars.ContextVar("ocr_upload_id", default="unknown")
 _OCR_DEADLINE = contextvars.ContextVar("ocr_deadline", default=None)
 _OCR_TIMINGS = contextvars.ContextVar("ocr_timings", default=None)
+_OCR_LANGUAGE_HINT = contextvars.ContextVar("ocr_language_hint", default="auto")
 _TESSERACT_LOCK = threading.Lock()
 _OCR_LANGUAGE_LOCK = threading.Lock()
 _TESSERACT_CACHE = None
@@ -63,6 +73,7 @@ OCR_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "90"))
 OCR_MAX_CONCURRENT = max(1, int(os.getenv("OCR_MAX_CONCURRENT", "1")))
 OCR_QUEUE_TIMEOUT = float(os.getenv("OCR_QUEUE_TIMEOUT", "10"))
 _OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
+_OCR_WORK_SEMAPHORE = threading.BoundedSemaphore(OCR_MAX_CONCURRENT)
 _DOCUMENT_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(4, min(8, OCR_MAX_CONCURRENT + 2)),
     thread_name_prefix="document-extract",
@@ -95,6 +106,21 @@ def _ocr_process_slot():
         yield
     finally:
         _OCR_SEMAPHORE.release()
+
+
+@contextmanager
+def _ocr_work_slot():
+    """Bound image decoding, preprocessing and OCR together per upload."""
+    queued = time.perf_counter()
+    acquired = _OCR_WORK_SEMAPHORE.acquire(timeout=OCR_QUEUE_TIMEOUT)
+    _ocr_log("ocr_work_queue", time.perf_counter() - queued,
+             result="acquired" if acquired else "busy")
+    if not acquired:
+        raise OCRQueueBusy("OCR capacity is busy")
+    try:
+        yield
+    finally:
+        _OCR_WORK_SEMAPHORE.release()
 
 app = FastAPI(title="JanSathi API", version="1.0.0", description="Private document understanding and citizen information API")
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(","), allow_credentials=False, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["*"])
@@ -187,6 +213,13 @@ def extract_text(path: Path, suffix: str) -> tuple[str, str]:
         doc = Document(str(path))
         return "\n".join(p.text for p in doc.paragraphs), "docx_text"
     return extract_image_ocr(path)
+
+
+def _extract_text_with_bounded_ocr(path: Path, suffix: str) -> tuple[str, str]:
+    if suffix in {".pdf", ".png", ".jpg", ".jpeg"}:
+        with _ocr_work_slot():
+            return extract_text(path, suffix)
+    return extract_text(path, suffix)
 
 def _tessdata_candidates(executable: str | None = None) -> list[Path]:
     explicit: list[Path] = []
@@ -301,6 +334,9 @@ def _probe_default_tessdata(executable: str) -> Path | None:
 
 def _terminate_and_reap(process: subprocess.Popen, code: int = -1) -> None:
     """Terminate a timed-out Tesseract child and always wait for its exit."""
+    started = time.perf_counter()
+    outcome = "terminated"
+    escalated = False
     try:
         process.terminate()
     except (OSError, ProcessLookupError):
@@ -308,19 +344,58 @@ def _terminate_and_reap(process: subprocess.Popen, code: int = -1) -> None:
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
+        escalated = True
         try:
             process.kill()
         except (OSError, ProcessLookupError):
             pass
         process.wait()
+    finally:
+        _ocr_log("tesseract_process_cleanup", time.perf_counter() - started,
+                 result=outcome, escalated=escalated)
+
+
+def _cache_pytesseract_version(pytesseract, version_output: str) -> None:
+    """Reuse the timeout-bounded --version probe in pytesseract's run-once cache."""
+    module = getattr(pytesseract, "pytesseract", None)
+    getter = getattr(module, "get_tesseract_version", None)
+    if not module or not getter or not hasattr(module, "parse"):
+        return
+    match = re.search(r"(?<!\d)\d+\.\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.-]+)?", version_output or "")
+    if not match:
+        _ocr_log("tesseract_version_cache", level=logging.WARNING, result="unparsed")
+        return
+    version = module.parse(match.group(0))
+    if version < module.TESSERACT_MIN_VERSION:
+        raise RuntimeError(f"Tesseract {version} is older than the supported minimum")
+    getter._result = version
+    _ocr_log("tesseract_version_cache", 0, version=version, result="primed")
 
 
 def _install_tesseract_timeout_cleanup(pytesseract) -> None:
     # pytesseract 0.3.13 can call Popen.kill() without waiting after terminate
     # times out; reap explicitly to avoid leaving a zombie child on Linux.
     module = getattr(pytesseract, "pytesseract", None)
-    if module is not None and getattr(module, "kill", None) is not _terminate_and_reap:
+    if module is None:
+        return
+    if getattr(module, "kill", None) is not _terminate_and_reap:
         module.kill = _terminate_and_reap
+    original = getattr(module, "run_tesseract", None)
+    if original is not None and not getattr(original, "_jansathi_timed", False):
+        @functools.wraps(original)
+        def measured_run_tesseract(*args, **kwargs):
+            started = time.perf_counter()
+            result = "ok"
+            try:
+                return original(*args, **kwargs)
+            except Exception as exc:
+                result = type(exc).__name__
+                raise
+            finally:
+                _ocr_log("tesseract_subprocess", time.perf_counter() - started,
+                         result=result)
+        measured_run_tesseract._jansathi_timed = True
+        module.run_tesseract = measured_run_tesseract
 
 
 def configure_tesseract():
@@ -359,6 +434,7 @@ def configure_tesseract():
             logger.warning("OCR unavailable: no runnable Tesseract executable was found.")
             return None
 
+        _cache_pytesseract_version(pytesseract, result.stdout or result.stderr)
         data_dirs = _tessdata_candidates(candidate)
         _OCR_TESSDATA_DIR = data_dirs[0] if data_dirs else _probe_default_tessdata(candidate)
         _TESSERACT_CACHE = (candidate, _OCR_TESSDATA_DIR)
@@ -558,6 +634,10 @@ class OCRProcessingTimeout(TimeoutError):
     """Raised when an OCR child process reaches its enforced deadline."""
 
 
+class OCRQueueBusy(TimeoutError):
+    """Raised when bounded OCR capacity is full before work starts."""
+
+
 def _run_ocr(pytesseract, image: Image.Image, config: str, purpose: str = "primary"):
     """Run one bounded Tesseract subprocess and derive both text and confidence."""
     started = time.perf_counter()
@@ -575,13 +655,13 @@ def _run_ocr(pytesseract, image: Image.Image, config: str, purpose: str = "prima
     except OCRProcessingTimeout:
         raise
     except Exception as exc:
-        _ocr_log("tesseract_subprocess", time.perf_counter() - started,
+        _ocr_log("tesseract_call", time.perf_counter() - started,
                  level=logging.ERROR, purpose=purpose, config=shlex.quote(config),
                  timeout_s=timeout, result=type(exc).__name__)
         if isinstance(exc, RuntimeError) and "process timeout" in str(exc).lower():
             raise OCRProcessingTimeout("Tesseract subprocess timed out") from exc
         raise
-    _ocr_log("tesseract_subprocess", time.perf_counter() - started, purpose=purpose,
+    _ocr_log("tesseract_call", time.perf_counter() - started, purpose=purpose,
              config=shlex.quote(config),
              timeout_s=timeout, result="ok")
     confidence = _mean_confidence(data)
@@ -641,17 +721,18 @@ def _language_specific_config(base_config: str, language: str) -> str:
     return shlex.join(parts)
 
 
-def ocr_language_config(pytesseract) -> str:
+def ocr_language_config(pytesseract, language_hint: str | None = None) -> str:
     # Serialize first-time discovery so concurrent uploads do not launch a
     # burst of identical --list-langs subprocesses.
     with _OCR_LANGUAGE_LOCK:
-        return _ocr_language_config_locked(pytesseract)
+        return _ocr_language_config_locked(pytesseract, language_hint)
 
 
-def _ocr_language_config_locked(pytesseract) -> str:
+def _ocr_language_config_locked(pytesseract, language_hint: str | None = None) -> str:
     started = time.perf_counter()
     command = getattr(getattr(pytesseract, "pytesseract", None), "tesseract_cmd", "mock")
-    cache_key = f"{command}|{_tessdata_config()}|{'+'.join(OCR_LANGS)}"
+    preferred = OCR_HINT_LANGUAGES.get(language_hint or "")
+    cache_key = f"{command}|{_tessdata_config()}|{'+'.join(OCR_LANGS)}|{'+'.join(preferred or ())}"
     if cache_key in _OCR_LANGUAGE_CACHE:
         languages = _OCR_LANGUAGE_CACHE[cache_key]
         _ocr_log("language_initialization", 0, cache="hit",
@@ -673,7 +754,10 @@ def _ocr_language_config_locked(pytesseract) -> str:
                  level=logging.WARNING, result=type(exc).__name__)
         logger.warning("Tesseract language discovery failed (%s).", type(exc).__name__)
         return ""
-    languages = [lang for lang in OCR_LANGS if lang in available]
+    if preferred and all(language in available for language in preferred):
+        languages = list(preferred)
+    else:
+        languages = [lang for lang in OCR_LANGS if lang in available]
     _OCR_LANGUAGE_CACHE[cache_key] = languages
     _ocr_log("language_initialization", time.perf_counter() - started,
              languages="+".join(languages) if languages else "none")
@@ -690,7 +774,7 @@ def extract_image_ocr(path: Path) -> tuple[str, str]:
         _ocr_log("total_ocr_execution", time.perf_counter() - total_started, result="unavailable")
         logger.warning("OCR unavailable: tesseract not configured")
         return "", "ocr_unavailable"
-    base_config = ocr_language_config(pytesseract)
+    base_config = ocr_language_config(pytesseract, _OCR_LANGUAGE_HINT.get())
     if not base_config:
         _ocr_log("total_ocr_execution", time.perf_counter() - total_started,
                  result="missing_language_data")
@@ -815,7 +899,7 @@ def extract_scanned_pdf(path: Path) -> tuple[str, str]:
     if not pytesseract:
         logger.warning("OCR unavailable: tesseract not configured")
         return "", "ocr_unavailable"
-    base_config = ocr_language_config(pytesseract)
+    base_config = ocr_language_config(pytesseract, _OCR_LANGUAGE_HINT.get())
     if not base_config:
         logger.warning("OCR unavailable: no language models configured")
         return "", "ocr_unavailable"
@@ -1059,11 +1143,16 @@ async def upload_document(request: Request, response: Response, file: UploadFile
         logger.info("Upload %s: starting text extraction (%s bytes)", doc_id, size)
         upload_context = _OCR_UPLOAD_ID.set(doc_id)
         deadline_context = _OCR_DEADLINE.set(time.perf_counter() + OCR_DOCUMENT_TIMEOUT)
+        language_hint = request.headers.get("x-ocr-language", "auto").strip().lower()
+        if language_hint not in OCR_HINT_LANGUAGES and language_hint != "auto":
+            logger.warning("Upload %s: invalid OCR language hint; using automatic multilingual mode", doc_id)
+            language_hint = "auto"
+        language_context = _OCR_LANGUAGE_HINT.set(language_hint)
         timings: dict[str, float] = {}
         timings_context = _OCR_TIMINGS.set(timings)
         extraction_context = contextvars.copy_context()
         extraction_future = _DOCUMENT_EXECUTOR.submit(
-            extraction_context.run, extract_text, target, suffix
+            extraction_context.run, _extract_text_with_bounded_ocr, target, suffix
         )
         try:
             text, extraction = await asyncio.wait_for(
@@ -1073,6 +1162,9 @@ async def upload_document(request: Request, response: Response, file: UploadFile
             target.unlink(missing_ok=True)
             logger.error("Upload %s: OCR subprocess deadline reached (%s)", doc_id, type(exc).__name__)
             raise HTTPException(504, "Document OCR timed out. Please try a smaller or simpler file.")
+        except OCRQueueBusy:
+            logger.warning("Upload %s: OCR capacity is busy; extraction did not start", doc_id)
+            raise HTTPException(503, "OCR is busy processing another document. Please retry shortly.")
         except asyncio.TimeoutError:
             defer_file_cleanup = True
             def cleanup_timed_out_extraction(_future) -> None:
@@ -1086,6 +1178,7 @@ async def upload_document(request: Request, response: Response, file: UploadFile
             _OCR_UPLOAD_ID.reset(upload_context)
             _OCR_DEADLINE.reset(deadline_context)
             _OCR_TIMINGS.reset(timings_context)
+            _OCR_LANGUAGE_HINT.reset(language_context)
         logger.info("Upload %s: extraction done (extraction=%s chars=%d)", doc_id, extraction, len(text))
         status = "completed" if text.strip() else "needs_ocr" if extraction in {"pdf_text", "ocr_unavailable", "ocr", "pdf_ocr"} else "no_text"
         record = {

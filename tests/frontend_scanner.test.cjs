@@ -347,6 +347,39 @@ test('failed automatic upload retains its capture and retry uses the same file o
   assert.equal(f.states.at(-1).phase, 'uploaded');
 });
 
+test('OCR timeout does not retry the same expensive upload', async () => {
+  const callbacks = new Map();
+  let nextHandle = 0, uploads = 0;
+  const f = setup();
+  const controller = createScannerController({
+    video: f.video, canvas: f.canvas, analysisCanvas: {}, mediaDevices: f.mediaDevices,
+    URLApi: { createObjectURL: () => 'blob:timeout', revokeObjectURL() {} },
+    makeFile: (blob, name) => Object.assign(blob, { name }),
+    detectFrame: () => ({ status: 'Document detected', box: { x: .18, y: .1, width: .64, height: .8 } }),
+    onState: state => f.states.push(state),
+    onAutoUpload: async () => {
+      uploads++;
+      const error = new Error('OCR timed out. Retake or choose a closer crop.');
+      error.status = 504; error.retryable = false;
+      throw error;
+    },
+    requestAnimationFrame: callback => { const id = ++nextHandle; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame: id => callbacks.delete(id),
+    detectorSettings: { stableFrames: 6, stableDurationMs: 700, sampleIntervalMs: 100 },
+  });
+  await controller.start();
+  for (const time of [100, 250, 400, 550, 700, 850]) {
+    const [id, cb] = [...callbacks.entries()][0]; callbacks.delete(id); cb(time);
+  }
+  const [captureId, captureFrame] = [...callbacks.entries()][0]; callbacks.delete(captureId); captureFrame(870);
+  await new Promise(resolve => setImmediate(resolve));
+  await controller.confirm();
+  assert.equal(f.states.at(-1).phase, 'upload-error');
+  assert.equal(f.states.at(-1).uploadRetryable, false);
+  assert.equal(await controller.retryUpload(), false);
+  assert.equal(uploads, 1);
+});
+
 test('camera movement resets stability and prevents an automatic capture', async () => {
   const callbacks = new Map();
   let nextHandle = 0, samples = 0;
